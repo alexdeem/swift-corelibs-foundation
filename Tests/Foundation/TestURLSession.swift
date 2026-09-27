@@ -143,6 +143,7 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
             
             public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
                 defer { expectation.fulfill() }
+                XCTAssertTrue(dataTask.delegate === self)
                 capital = String(data: data, encoding: .utf8)!
             }
         }
@@ -2059,6 +2060,21 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         task.resume()
 
         await fulfillment(of: [expectation], timeout: 5)
+    }
+
+    func test_taskDelegateGetterDoesNotReturnSessionDelegate() throws {
+        final class EmptySessionDelegate: NSObject, URLSessionTaskDelegate, Sendable {}
+        let sessionDelegate = EmptySessionDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: sessionDelegate, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/country.txt"))
+        let task = session.dataTask(with: url)
+
+        XCTAssertNil(task.delegate)
+        final class EmptyTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable {}
+        let taskDelegate = EmptyTaskDelegate()
+        task.delegate = taskDelegate
+        XCTAssertTrue(task.delegate === taskDelegate)
+        task.cancel()
     }
 
     func test_getAllTasks() async throws {
