@@ -304,7 +304,7 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         // TODO: InputStream is not Sendable, but it seems safe here because of the wait on the dispatch group. It would be nice to prove this to the compiler.
         nonisolated(unsafe) var currentInputStream: InputStream?
         
-        if let delegate = task?.delegate {
+        if let delegate = task?.effectiveDelegate {
             let dispatchGroup = DispatchGroup()
             dispatchGroup.enter()
             

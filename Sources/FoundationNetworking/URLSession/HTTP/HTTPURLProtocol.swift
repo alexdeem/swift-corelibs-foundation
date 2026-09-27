@@ -471,7 +471,7 @@ internal class _HTTPURLProtocol: _NativeProtocol {
 
         guard let session = task?.session as? URLSession else { fatalError() }
 
-        if let delegate = task?.delegate {
+        if let delegate = task?.effectiveDelegate {
             // At this point we need to change the internal state to note
             // that we're waiting for the delegate to call the completion
             // handler. Then we'll call the delegate callback

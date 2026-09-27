@@ -124,10 +124,14 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     internal var session: URLSessionProtocol! //change to nil when task completes
 
     private var _taskDelegate: URLSessionTaskDelegate?
+    // Internal callbacks may use the session delegate when no task-specific
+    // delegate was supplied. Keep that policy separate from the public getter.
+    internal var effectiveDelegate: URLSessionTaskDelegate? {
+        _taskDelegate ?? (actualSession?.delegate as? URLSessionTaskDelegate)
+    }
     open var delegate: URLSessionTaskDelegate? {
         get {
-            if let _taskDelegate { return _taskDelegate }
-            return self.actualSession?.delegate as? URLSessionTaskDelegate
+            effectiveDelegate
         }
         set {
             guard !self.hasTriggeredResume else {
@@ -246,7 +250,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
             return
         }
         
-        if let session = actualSession, let delegate = self.delegate {
+        if let session = actualSession, let delegate = effectiveDelegate {
             nonisolated(unsafe) let nonisolatedCompletion = completion
             delegate.urlSession(session, task: self) { (stream) in
                 if let stream = stream {
@@ -1196,7 +1200,7 @@ extension _ProtocolClient : URLProtocolClient {
             let cacheable = CachedURLResponse(response: response, data: Data(data.joined()), storagePolicy: cachePolicy)
             let protocolAllows = (urlProtocol as? _NativeProtocol)?.canCache(cacheable) ?? false
             if protocolAllows {
-                if let delegate = task.delegate as? URLSessionDataDelegate {
+                if let delegate = task.effectiveDelegate as? URLSessionDataDelegate {
                     delegate.urlSession(task.session as! URLSession, dataTask: task, willCacheResponse: cacheable) { (actualCacheable) in
                         if let actualCacheable = actualCacheable {
                             cache.storeCachedResponse(actualCacheable, for: task)
@@ -1323,7 +1327,7 @@ extension _ProtocolClient : URLProtocolClient {
             }
         }
         
-        if let delegate = task.delegate {
+        if let delegate = task.effectiveDelegate {
             session.delegateQueue.addOperation {
                 delegate.urlSession(session, task: task, didReceive: challenge) { disposition, credential in
                     
