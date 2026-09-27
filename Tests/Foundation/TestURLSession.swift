@@ -1997,6 +1997,53 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         XCTAssertTrue(tasks.allSatisfy { $0.state == .completed })
     }
 
+    func test_taskBehaviourCanBeReadOutsideSessionWorkQueue() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PausedTaskProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let task = session.dataTask(with: try XCTUnwrap(URL(string: "paused-task://example"))) { _, _, _ in }
+        let result = expectation(description: "behavior read on an independent queue")
+
+        DispatchQueue.global().async {
+            switch session.behaviour(for: task) {
+            case .dataCompletionHandler:
+                break
+            default:
+                XCTFail("Expected the task's completion handler behavior")
+            }
+            result.fulfill()
+        }
+
+        await fulfillment(of: [result], timeout: 5)
+        task.cancel()
+    }
+
+    func test_taskBehaviourRetainsCompletionCaptureAfterCompletion() async throws {
+        final class Capture: Sendable {}
+
+        let session = URLSession(configuration: .ephemeral)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/Nepal"))
+        let completion = expectation(description: "task completed")
+        weak var weakCapture: Capture?
+
+        func createTask() -> URLSessionDataTask {
+            let capture = Capture()
+            weakCapture = capture
+            return session.dataTask(with: url) { [capture] _, _, _ in
+                _ = capture
+                completion.fulfill()
+            }
+        }
+
+        let task = createTask()
+        XCTAssertNotNil(weakCapture)
+        task.resume()
+        await fulfillment(of: [completion], timeout: 5)
+        session.workQueue.sync {} // Wait until the task is removed from the registry.
+        withExtendedLifetime(task) {
+            XCTAssertNotNil(weakCapture)
+        }
+    }
     #endif
 
     func test_sessionDelegateCalledIfTaskDelegateDoesNotImplement() async throws {
