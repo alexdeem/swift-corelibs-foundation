@@ -575,13 +575,13 @@ fileprivate extension URLSession {
     /// Create a data task.
     ///
     /// All public methods funnel into this one.
-    func dataTask(with request: _Request, behaviour: _TaskRegistry._Behaviour) -> URLSessionDataTask {
+    func dataTask(with request: _Request, behaviour: URLSessionTask._Behaviour) -> URLSessionDataTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionDataTask(session: self, request: r, taskIdentifier: i)
+        let task = URLSessionDataTask(session: self, request: r, taskIdentifier: i, behaviour: behaviour)
         workQueue.async {
-            self.taskRegistry.add(task, behaviour: behaviour)
+            self.taskRegistry.add(task)
         }
         return task
     }
@@ -589,52 +589,50 @@ fileprivate extension URLSession {
     /// Create an upload task.
     ///
     /// All public methods funnel into this one.
-    func uploadTask(with request: _Request, body: URLSessionTask._Body?, behaviour: _TaskRegistry._Behaviour) -> URLSessionUploadTask {
+    func uploadTask(with request: _Request, body: URLSessionTask._Body?, behaviour: URLSessionTask._Behaviour) -> URLSessionUploadTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionUploadTask(session: self, request: r, taskIdentifier: i, body: body)
+        let task = URLSessionUploadTask(session: self, request: r, taskIdentifier: i, body: body, behaviour: behaviour)
         workQueue.async {
-            self.taskRegistry.add(task, behaviour: behaviour)
+            self.taskRegistry.add(task)
         }
         return task
     }
     
     /// Create a download task
-    func downloadTask(with request: _Request, behavior: _TaskRegistry._Behaviour) -> URLSessionDownloadTask {
+    func downloadTask(with request: _Request, behavior: URLSessionTask._Behaviour) -> URLSessionDownloadTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionDownloadTask(session: self, request: r, taskIdentifier: i)
+        let task = URLSessionDownloadTask(session: self, request: r, taskIdentifier: i, behaviour: behavior)
         workQueue.async {
-            self.taskRegistry.add(task, behaviour: behavior)
+            self.taskRegistry.add(task)
         }
         return task
     }
   
     /// Create a web socket task
-    func webSocketTask(with request: _Request, behavior: _TaskRegistry._Behaviour) -> URLSessionWebSocketTask {
+    func webSocketTask(with request: _Request, behavior: URLSessionTask._Behaviour) -> URLSessionWebSocketTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionWebSocketTask(session: self, request: r, taskIdentifier: i, body: URLSessionTask._Body.none)
+        let task = URLSessionWebSocketTask(session: self, request: r, taskIdentifier: i, body: URLSessionTask._Body.none, behaviour: behavior)
         workQueue.async {
-            self.taskRegistry.add(task, behaviour: behavior)
+            self.taskRegistry.add(task)
         }
         return task
     }
 
     /// Create a download task that is marked invalid.
-    func invalidDownloadTask(behavior: _TaskRegistry._Behaviour) -> URLSessionDownloadTask {
+    func invalidDownloadTask(behavior: URLSessionTask._Behaviour) -> URLSessionDownloadTask {
         /* We do not support resume data in swift-corelibs-foundation, so whatever we are passed, we should just behave as Darwin does in the presence of invalid data. */
         
         guard !self.invalidated else { fatalError("Session invalidated") }
-        let task = URLSessionDownloadTask()
+        let task = URLSessionDownloadTask(invalidResumeDataSession: self, taskIdentifier: createNextTaskIdentifier(), behaviour: behavior)
         task.createdFromInvalidResumeData = true
-        task.taskIdentifier = createNextTaskIdentifier()
-        task.session = self
         workQueue.async {
-            self.taskRegistry.add(task, behaviour: behavior)
+            self.taskRegistry.add(task)
         }
         return task
     }
@@ -643,29 +641,28 @@ fileprivate extension URLSession {
 internal extension URLSession {
     /// The kind of callback / delegate behaviour of a task.
     ///
-    /// This is similar to the `URLSession.TaskRegistry.Behaviour`, but it
-    /// also encodes the kind of delegate that the session has.
+    /// This resolves the task's stored behaviour with the session delegate.
     enum _TaskBehaviour {
         /// The session has no delegate, or just a plain `URLSessionDelegate`.
         case noDelegate
         /// The session has a delegate of type `URLSessionTaskDelegate`
         case taskDelegate(URLSessionTaskDelegate)
         /// Default action for all events, except for completion.
-        /// - SeeAlso: URLSession.TaskRegistry.Behaviour.dataCompletionHandler
-        case dataCompletionHandler(URLSession._TaskRegistry.DataTaskCompletion)
+        /// - SeeAlso: URLSessionTask._Behaviour.dataCompletionHandler
+        case dataCompletionHandler(URLSessionTask.DataTaskCompletion)
         /// Default action for all asynchronous events.
-        /// - SeeAlso: URLsession.TaskRegistry.Behaviour.dataCompletionHandlerWithTaskDelegate
-        case dataCompletionHandlerWithTaskDelegate(URLSession._TaskRegistry.DataTaskCompletion, URLSessionTaskDelegate)
+        /// - SeeAlso: URLSessionTask._Behaviour.dataCompletionHandlerWithTaskDelegate
+        case dataCompletionHandlerWithTaskDelegate(URLSessionTask.DataTaskCompletion, URLSessionTaskDelegate)
         /// Default action for all events, except for completion.
-        /// - SeeAlso: URLSession.TaskRegistry.Behaviour.downloadCompletionHandler
-        case downloadCompletionHandler(URLSession._TaskRegistry.DownloadTaskCompletion)
+        /// - SeeAlso: URLSessionTask._Behaviour.downloadCompletionHandler
+        case downloadCompletionHandler(URLSessionTask.DownloadTaskCompletion)
         /// Default action for all asynchronous events.
-        /// - SeeAlso: URLsession.TaskRegistry.Behaviour.downloadCompletionHandlerWithTaskDelegate
-        case downloadCompletionHandlerWithTaskDelegate(URLSession._TaskRegistry.DownloadTaskCompletion, URLSessionTaskDelegate)
+        /// - SeeAlso: URLSessionTask._Behaviour.downloadCompletionHandlerWithTaskDelegate
+        case downloadCompletionHandlerWithTaskDelegate(URLSessionTask.DownloadTaskCompletion, URLSessionTaskDelegate)
     }
 
     func behaviour(for task: URLSessionTask) -> _TaskBehaviour {
-        switch taskRegistry.behaviour(for: task) {
+        switch task.getBehaviour() {
         case .dataCompletionHandler(let c): return .dataCompletionHandler(c)
         case .dataCompletionHandlerWithTaskDelegate(let c, let d):
             guard let d else {
@@ -740,7 +737,7 @@ extension URLSession {
         let cancelState = CancelState()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let completionHandler: URLSession._TaskRegistry.DataTaskCompletion = { data, response, error in
+                let completionHandler: URLSessionTask.DataTaskCompletion = { data, response, error in
                     if let error = error {
                         continuation.resume(throwing: error)
                     } else {
@@ -766,7 +763,7 @@ extension URLSession {
         let cancelState = CancelState()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let completionHandler: URLSession._TaskRegistry.DataTaskCompletion = { data, response, error in
+                let completionHandler: URLSessionTask.DataTaskCompletion = { data, response, error in
                     if let error = error {
                         continuation.resume(throwing: error)
                     } else {
@@ -793,7 +790,7 @@ extension URLSession {
         let cancelState = CancelState()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let completionHandler: URLSession._TaskRegistry.DataTaskCompletion = { data, response, error in
+                let completionHandler: URLSessionTask.DataTaskCompletion = { data, response, error in
                     if let error = error {
                         continuation.resume(throwing: error)
                     } else {
@@ -820,7 +817,7 @@ extension URLSession {
         let cancelState = CancelState()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let completionHandler: URLSession._TaskRegistry.DataTaskCompletion = { data, response, error in
+                let completionHandler: URLSessionTask.DataTaskCompletion = { data, response, error in
                     if let error = error {
                         continuation.resume(throwing: error)
                     } else {
@@ -846,7 +843,7 @@ extension URLSession {
         let cancelState = CancelState()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let completionHandler: URLSession._TaskRegistry.DownloadTaskCompletion = { location, response, error in
+                let completionHandler: URLSessionTask.DownloadTaskCompletion = { location, response, error in
                     if let error = error {
                         continuation.resume(throwing: error)
                     } else {
@@ -872,7 +869,7 @@ extension URLSession {
         let cancelState = CancelState()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let completionHandler: URLSession._TaskRegistry.DownloadTaskCompletion = { location, response, error in
+                let completionHandler: URLSessionTask.DownloadTaskCompletion = { location, response, error in
                     if let error = error {
                         continuation.resume(throwing: error)
                     } else {
