@@ -575,11 +575,11 @@ fileprivate extension URLSession {
     /// Create a data task.
     ///
     /// All public methods funnel into this one.
-    func dataTask(with request: _Request, behaviour: URLSessionTask._Behaviour) -> URLSessionDataTask {
+    func dataTask(with request: _Request, behaviour: URLSessionTask._Behaviour, taskDelegate: URLSessionTaskDelegate? = nil) -> URLSessionDataTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionDataTask(session: self, request: r, taskIdentifier: i, behaviour: behaviour)
+        let task = URLSessionDataTask(session: self, request: r, taskIdentifier: i, behaviour: behaviour, taskDelegate: taskDelegate)
         workQueue.async {
             self.taskRegistry.add(task)
         }
@@ -589,11 +589,11 @@ fileprivate extension URLSession {
     /// Create an upload task.
     ///
     /// All public methods funnel into this one.
-    func uploadTask(with request: _Request, body: URLSessionTask._Body?, behaviour: URLSessionTask._Behaviour) -> URLSessionUploadTask {
+    func uploadTask(with request: _Request, body: URLSessionTask._Body?, behaviour: URLSessionTask._Behaviour, taskDelegate: URLSessionTaskDelegate? = nil) -> URLSessionUploadTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionUploadTask(session: self, request: r, taskIdentifier: i, body: body, behaviour: behaviour)
+        let task = URLSessionUploadTask(session: self, request: r, taskIdentifier: i, body: body, behaviour: behaviour, taskDelegate: taskDelegate)
         workQueue.async {
             self.taskRegistry.add(task)
         }
@@ -601,11 +601,11 @@ fileprivate extension URLSession {
     }
     
     /// Create a download task
-    func downloadTask(with request: _Request, behavior: URLSessionTask._Behaviour) -> URLSessionDownloadTask {
+    func downloadTask(with request: _Request, behavior: URLSessionTask._Behaviour, taskDelegate: URLSessionTaskDelegate? = nil) -> URLSessionDownloadTask {
         guard !self.invalidated else { fatalError("Session invalidated") }
         let r = createConfiguredRequest(from: request)
         let i = createNextTaskIdentifier()
-        let task = URLSessionDownloadTask(session: self, request: r, taskIdentifier: i, behaviour: behavior)
+        let task = URLSessionDownloadTask(session: self, request: r, taskIdentifier: i, behaviour: behavior, taskDelegate: taskDelegate)
         workQueue.async {
             self.taskRegistry.add(task)
         }
@@ -744,7 +744,7 @@ extension URLSession {
                         continuation.resume(returning: (data!, response!))
                     }
                 }
-                let task = dataTask(with: _Request(request), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate))
+                let task = dataTask(with: _Request(request), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate), taskDelegate: delegate)
                 task._callCompletionHandlerInline = true
                 task.resume()
                 cancelState.activate(task: task)
@@ -770,7 +770,7 @@ extension URLSession {
                         continuation.resume(returning: (data!, response!))
                     }
                 }
-                let task = dataTask(with: _Request(url), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate))
+                let task = dataTask(with: _Request(url), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate), taskDelegate: delegate)
                 task._callCompletionHandlerInline = true
                 task.resume()
                 cancelState.activate(task: task)
@@ -797,7 +797,7 @@ extension URLSession {
                         continuation.resume(returning: (data!, response!))
                     }
                 }
-                let task = uploadTask(with: _Request(request), body: .file(fileURL), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate))
+                let task = uploadTask(with: _Request(request), body: .file(fileURL), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate), taskDelegate: delegate)
                 task._callCompletionHandlerInline = true
                 task.resume()
                 cancelState.activate(task: task)
@@ -824,7 +824,7 @@ extension URLSession {
                         continuation.resume(returning: (data!, response!))
                     }
                 }
-                let task = uploadTask(with: _Request(request), body: .data(createDispatchData(bodyData)), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate))
+                let task = uploadTask(with: _Request(request), body: .data(createDispatchData(bodyData)), behaviour: .dataCompletionHandlerWithTaskDelegate(completionHandler, delegate), taskDelegate: delegate)
                 task._callCompletionHandlerInline = true
                 task.resume()
                 cancelState.activate(task: task)
@@ -850,7 +850,7 @@ extension URLSession {
                         continuation.resume(returning: (location!, response!))
                     }
                 }
-                let task = downloadTask(with: _Request(request), behavior: .downloadCompletionHandlerWithTaskDelegate(completionHandler, delegate))
+                let task = downloadTask(with: _Request(request), behavior: .downloadCompletionHandlerWithTaskDelegate(completionHandler, delegate), taskDelegate: delegate)
                 task._callCompletionHandlerInline = true
                 task.resume()
                 cancelState.activate(task: task)
@@ -876,7 +876,7 @@ extension URLSession {
                         continuation.resume(returning: (location!, response!))
                     }
                 }
-                let task = downloadTask(with: _Request(url), behavior: .downloadCompletionHandlerWithTaskDelegate(completionHandler, delegate))
+                let task = downloadTask(with: _Request(url), behavior: .downloadCompletionHandlerWithTaskDelegate(completionHandler, delegate), taskDelegate: delegate)
                 task._callCompletionHandlerInline = true
                 task.resume()
                 cancelState.activate(task: task)

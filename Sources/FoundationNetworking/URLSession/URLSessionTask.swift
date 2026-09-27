@@ -131,7 +131,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     }
     open var delegate: URLSessionTaskDelegate? {
         get {
-            effectiveDelegate
+            _taskDelegate
         }
         set {
             guard !self.hasTriggeredResume else {
@@ -289,17 +289,17 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
         super.init()
     }
     /// Create a data task. If there is a httpBody in the URLRequest, use that as a parameter
-    internal convenience init(session: URLSession, request: URLRequest, taskIdentifier: Int, behaviour: _Behaviour) {
+    internal convenience init(session: URLSession, request: URLRequest, taskIdentifier: Int, behaviour: _Behaviour, taskDelegate: URLSessionTaskDelegate? = nil) {
         if let bodyData = request.httpBody, !bodyData.isEmpty {
-            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.data(createDispatchData(bodyData)), behaviour: behaviour)
+            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.data(createDispatchData(bodyData)), behaviour: behaviour, taskDelegate: taskDelegate)
         } else if let bodyStream = request.httpBodyStream {
-            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.stream(bodyStream), behaviour: behaviour)
+            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.stream(bodyStream), behaviour: behaviour, taskDelegate: taskDelegate)
         } else {
-            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.none, behaviour: behaviour)
+            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.none, behaviour: behaviour, taskDelegate: taskDelegate)
         }
     }
 
-    internal init(session: URLSession, request: URLRequest, taskIdentifier: Int, body: _Body?, behaviour: _Behaviour) {
+    internal init(session: URLSession, request: URLRequest, taskIdentifier: Int, body: _Body?, behaviour: _Behaviour, taskDelegate: URLSessionTaskDelegate? = nil) {
         self.session = session
         /* make sure we're actually having a serial queue as it's used for synchronization */
         self.workQueue = DispatchQueue.init(label: "org.swift.URLSessionTask.WorkQueue", target: session.workQueue)
@@ -307,6 +307,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
         self.originalRequest = request
         self.knownBody = body
         self.behaviourStorage = behaviour
+        self._taskDelegate = taskDelegate
         super.init()
         self.currentRequest = request
         self.progress.cancellationHandler = { [weak self] in
