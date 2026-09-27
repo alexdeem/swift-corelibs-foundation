@@ -129,13 +129,8 @@ internal class _WebSocketURLProtocol: _HTTPURLProtocol {
         guard let t = self.task else {
             fatalError("Cannot notify")
         }
-        switch t.session.behaviour(for: t) {
-        case .noDelegate:
-            break
-        case .taskDelegate:
-            break
-        default:
-            fatalError("Unexpected behaviour for URLSessionWebSocketTask")
+        guard case nil = t.completion else {
+            fatalError("Unexpected completion for URLSessionWebSocketTask")
         }
         guard let task = t as? URLSessionWebSocketTask else {
             fatalError("Cast to URLSessionWebSocketTask failed")

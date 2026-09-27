@@ -1998,7 +1998,7 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         XCTAssertTrue(tasks.allSatisfy { $0.state == .completed })
     }
 
-    func test_taskBehaviourCanBeReadOutsideSessionWorkQueue() async throws {
+    func test_taskCompletionCanBeReadOutsideSessionWorkQueue() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PausedTaskProtocol.self]
         let session = URLSession(configuration: configuration)
@@ -2006,11 +2006,11 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         let result = expectation(description: "behavior read on an independent queue")
 
         DispatchQueue.global().async {
-            switch session.behaviour(for: task) {
-            case .dataCompletionHandler:
+            switch task.completion {
+            case .data:
                 break
             default:
-                XCTFail("Expected the task's completion handler behavior")
+                XCTFail("Expected the task's data completion")
             }
             result.fulfill()
         }

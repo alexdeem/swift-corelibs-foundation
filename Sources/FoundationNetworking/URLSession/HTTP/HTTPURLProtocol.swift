@@ -518,13 +518,7 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         guard let _ = task as? URLSessionDataTask else { return }
         guard case .transferInProgress(let ts) = self.internalState else { fatalError("Transfer not in progress.") }
         guard let response = ts.response as? HTTPURLResponse else { fatalError("Header complete, but not URL response.") }
-        guard let session = task?.session as? URLSession else { fatalError() }
-        switch session.behaviour(for: self.task!) {
-        case .noDelegate:
-            break
-        case .taskDelegate,
-             .dataCompletionHandlerWithTaskDelegate,
-             .downloadCompletionHandlerWithTaskDelegate:
+        if self.task!.callbackDelegate != nil {
             //TODO: There's a problem with libcurl / with how we're using it.
             // We're currently unable to pause the transfer / the easy handle:
             // https://curl.haxx.se/mail/lib-2016-03/0222.html
@@ -537,10 +531,6 @@ internal class _HTTPURLProtocol: _NativeProtocol {
             default:
                 self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             }
-        case .dataCompletionHandler:
-            break
-        case .downloadCompletionHandler:
-            break
         }
     }
 
