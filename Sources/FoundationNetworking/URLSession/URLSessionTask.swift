@@ -43,19 +43,30 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     internal let completion: Completion?
     internal let usesAsyncCompletion: Bool
 
-    /// Preserve the existing callback routing while completion storage changes.
-    /// Delegate-only tasks use the session delegate, async conveniences use
-    /// their task delegate, and completion-handler tasks bypass these callbacks.
+    /// Delegate-only tasks use their task delegate or the session delegate.
+    /// Async conveniences retain their task delegate for progress callbacks;
+    /// completion-handler tasks bypass ordinary data and task callbacks.
     internal var callbackDelegate: URLSessionTaskDelegate? {
-        completion == nil ? actualSession?.delegate as? URLSessionTaskDelegate : (usesAsyncCompletion ? delegate : nil)
+        completion == nil ? effectiveDelegate : (usesAsyncCompletion ? delegate : nil)
     }
 
+    /// Choose a delegate that can receive data callbacks. A task delegate
+    /// that does not conform to URLSessionDataDelegate leaves these callbacks
+    /// to the session's data delegate on delegate-only tasks.
     internal var dataCallbackDelegate: URLSessionDataDelegate? {
-        callbackDelegate as? URLSessionDataDelegate
+        guard callbackDelegate != nil else { return nil }
+        if completion == nil {
+            return (delegate as? URLSessionDataDelegate) ?? (actualSession?.delegate as? URLSessionDataDelegate)
+        }
+        return delegate as? URLSessionDataDelegate
     }
 
     internal var downloadCallbackDelegate: URLSessionDownloadDelegate? {
-        callbackDelegate as? URLSessionDownloadDelegate
+        guard callbackDelegate != nil else { return nil }
+        if completion == nil {
+            return (delegate as? URLSessionDownloadDelegate) ?? (actualSession?.delegate as? URLSessionDownloadDelegate)
+        }
+        return delegate as? URLSessionDownloadDelegate
     }
     
     // These properties aren't heeded in swift-corelibs-foundation, but we may heed them in the future. They exist for source compatibility.

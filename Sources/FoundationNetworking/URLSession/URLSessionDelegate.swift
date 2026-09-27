@@ -258,7 +258,11 @@ extension URLSessionDataDelegate {
     
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didBecome streamTask: URLSessionStreamTask) { }
     
-    public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) { }
+    public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if self === dataTask.delegate, let sessionDelegate = session.delegate as? URLSessionDataDelegate, self !== sessionDelegate {
+            sessionDelegate.urlSession(session, dataTask: dataTask, didReceive: data)
+        }
+    }
     
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, willCacheResponse proposedResponse: CachedURLResponse, completionHandler: @Sendable @escaping (CachedURLResponse?) -> Void) {
         if self === dataTask.delegate, let sessionDelegate = session.delegate as? URLSessionDataDelegate, self !== sessionDelegate {
@@ -294,9 +298,17 @@ public protocol URLSessionDownloadDelegate : URLSessionTaskDelegate {
 }
 
 extension URLSessionDownloadDelegate {
-    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) { }
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        if self === downloadTask.delegate, let sessionDelegate = session.delegate as? URLSessionDownloadDelegate, self !== sessionDelegate {
+            sessionDelegate.urlSession(session, downloadTask: downloadTask, didWriteData: bytesWritten, totalBytesWritten: totalBytesWritten, totalBytesExpectedToWrite: totalBytesExpectedToWrite)
+        }
+    }
     
-    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) { }
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) {
+        if self === downloadTask.delegate, let sessionDelegate = session.delegate as? URLSessionDownloadDelegate, self !== sessionDelegate {
+            sessionDelegate.urlSession(session, downloadTask: downloadTask, didResumeAtOffset: fileOffset, expectedTotalBytes: expectedTotalBytes)
+        }
+    }
 }
 
 public protocol URLSessionStreamDelegate : URLSessionTaskDelegate {
