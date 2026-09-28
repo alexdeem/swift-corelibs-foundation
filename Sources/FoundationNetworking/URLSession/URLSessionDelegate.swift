@@ -94,6 +94,12 @@ extension URLSessionDelegate {
  * Messages related to the operation of a specific task.
  */
 public protocol URLSessionTaskDelegate : URLSessionDelegate, Sendable {
+
+    /// Notifies the session delegate when a task is created. This callback runs
+    /// synchronously before the task creation method returns, rather than on
+    /// the session's delegate queue, so the delegate can configure the task
+    /// before it is resumed.
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask)
     
     /* An HTTP request is attempting to perform a redirection to a different
      * URL. You must invoke the completion routine to allow the
@@ -135,6 +141,8 @@ public protocol URLSessionTaskDelegate : URLSessionDelegate, Sendable {
 }
 
 extension URLSessionTaskDelegate {
+    public func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) { }
+
     public func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @Sendable @escaping (URLRequest?) -> Void) {
         // If the task's delegate does not implement this function, check if the session's delegate does
         if self === task.delegate, let sessionDelegate = session.delegate as? URLSessionTaskDelegate, self !== sessionDelegate {
