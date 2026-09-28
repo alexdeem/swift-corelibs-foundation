@@ -568,6 +568,11 @@ fileprivate extension URLSession {
 }
 
 fileprivate extension URLSession {
+    /// Called on the creator's thread, before returning a newly registered task.
+    func notifyDelegateOfTaskCreation(_ task: URLSessionTask) {
+        (delegate as? URLSessionTaskDelegate)?.urlSession(self, didCreateTask: task)
+    }
+
     /// Create a data task.
     ///
     /// All public methods funnel into this one.
@@ -579,6 +584,7 @@ fileprivate extension URLSession {
         workQueue.async {
             self.taskRegistry.add(task, behaviour: behaviour)
         }
+        notifyDelegateOfTaskCreation(task)
         return task
     }
     
@@ -593,6 +599,7 @@ fileprivate extension URLSession {
         workQueue.async {
             self.taskRegistry.add(task, behaviour: behaviour)
         }
+        notifyDelegateOfTaskCreation(task)
         return task
     }
     
@@ -605,6 +612,7 @@ fileprivate extension URLSession {
         workQueue.async {
             self.taskRegistry.add(task, behaviour: behavior)
         }
+        notifyDelegateOfTaskCreation(task)
         return task
     }
   
@@ -617,6 +625,7 @@ fileprivate extension URLSession {
         workQueue.async {
             self.taskRegistry.add(task, behaviour: behavior)
         }
+        notifyDelegateOfTaskCreation(task)
         return task
     }
 
@@ -632,6 +641,7 @@ fileprivate extension URLSession {
         workQueue.async {
             self.taskRegistry.add(task, behaviour: behavior)
         }
+        notifyDelegateOfTaskCreation(task)
         return task
     }
 }

@@ -15,6 +15,51 @@
     #endif
 #endif
 
+import Synchronization
+
+private final class TaskCreationRecorder: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    struct Event: Sendable {
+        let task: URLSessionTask
+        let state: URLSessionTask.State
+    }
+
+    let events = Mutex<[Event]>([])
+    let replacement: URLSessionTaskDelegate?
+    let cancelOnCreation: Bool
+
+    init(replacement: URLSessionTaskDelegate? = nil, cancelOnCreation: Bool = false) {
+        self.replacement = replacement
+        self.cancelOnCreation = cancelOnCreation
+    }
+
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+        events.withLock { $0.append(Event(task: task, state: task.state)) }
+        if let replacement {
+            task.delegate = replacement
+        }
+        if cancelOnCreation {
+            task.cancel()
+        }
+    }
+}
+
+private final class TaskCreationProbeProtocol: URLProtocol {
+    static let starts = Mutex(0)
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "task-creation.invalid"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.starts.withLock { $0 += 1 }
+        client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+    }
+
+    override func stopLoading() { }
+}
+
 @MainActor
 final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
 
@@ -1926,6 +1971,84 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         task.resume()
 
         await fulfillment(of: [expectation], timeout: 5)
+    }
+
+    func test_didCreateTaskRunsBeforeFactoriesReturn() throws {
+        let recorder = TaskCreationRecorder()
+        let delegateQueue = OperationQueue()
+        delegateQueue.isSuspended = true
+        let session = URLSession(configuration: .ephemeral, delegate: recorder, delegateQueue: delegateQueue)
+        let url = try XCTUnwrap(URL(string: "http://task-creation.invalid/request"))
+        let webSocketURL = try XCTUnwrap(URL(string: "ws://task-creation.invalid/socket"))
+
+        let tasks: [URLSessionTask] = [
+            session.dataTask(with: url),
+            session.dataTask(with: url) { _, _, _ in },
+            session.uploadTask(with: URLRequest(url: url), from: Data()),
+            session.downloadTask(with: url),
+            session.downloadTask(withResumeData: Data()),
+            session.webSocketTask(with: webSocketURL),
+        ]
+
+        let events = recorder.events.withLock { $0 }
+        XCTAssertEqual(events.count, tasks.count)
+        for (event, task) in zip(events, tasks) {
+            XCTAssertTrue(event.task === task)
+            XCTAssertEqual(event.state, .suspended)
+        }
+
+        delegateQueue.isSuspended = false
+        session.invalidateAndCancel()
+    }
+
+    func test_didCreateTaskCanInstallTaskDelegate() throws {
+        final class ReplacementDelegate: NSObject, URLSessionTaskDelegate, Sendable { }
+
+        let replacement = ReplacementDelegate()
+        let recorder = TaskCreationRecorder(replacement: replacement)
+        let session = URLSession(configuration: .ephemeral, delegate: recorder, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://task-creation.invalid/request"))
+
+        let task = session.dataTask(with: url)
+        XCTAssertTrue(recorder.events.withLock { $0.first?.task === task })
+        XCTAssertTrue(task.delegate === replacement)
+        session.invalidateAndCancel()
+    }
+
+    func test_didCreateTaskCanCancelBeforeLoading() async throws {
+        TaskCreationProbeProtocol.starts.withLock { $0 = 0 }
+        let recorder = TaskCreationRecorder(cancelOnCreation: true)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TaskCreationProbeProtocol.self]
+        let session = URLSession(configuration: configuration, delegate: recorder, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://task-creation.invalid/request"))
+        let completed = expectation(description: "task cancelled before loading")
+
+        let task = session.dataTask(with: url) { _, _, error in
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+            completed.fulfill()
+        }
+        XCTAssertTrue(recorder.events.withLock { $0.first?.task === task })
+        task.resume()
+
+        await fulfillment(of: [completed], timeout: 5)
+        XCTAssertEqual(TaskCreationProbeProtocol.starts.withLock { $0 }, 0)
+        session.invalidateAndCancel()
+    }
+
+    func test_didCreateTaskObservesAsyncDataTask() async throws {
+        guard #available(macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0, *) else { return }
+        let recorder = TaskCreationRecorder()
+        let session = URLSession(configuration: .ephemeral, delegate: recorder, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/USA"))
+
+        let (data, _) = try await session.data(from: url, delegate: nil)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "Washington, D.C.")
+        let events = recorder.events.withLock { $0 }
+        XCTAssertEqual(events.count, 1)
+        XCTAssertTrue(events.first?.task is URLSessionDataTask)
+        XCTAssertEqual(events.first?.state, .suspended)
+        session.invalidateAndCancel()
     }
 
     func test_getAllTasks() async throws {
