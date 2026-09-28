@@ -1103,7 +1103,10 @@ extension _ProtocolClient : URLProtocolClient {
         guard let task = urlProtocol.task else { fatalError() }
         guard let session = task.session as? URLSession else { fatalError() }
         let urlResponse = task.response
-        if let response = urlResponse as? HTTPURLResponse, response.statusCode == 401 {
+        // Only native protocols turn an HTTP 401 response into a challenge.
+        // A custom protocol explicitly reports any challenge it wants to issue.
+        if urlProtocol is _NativeProtocol,
+           let response = urlResponse as? HTTPURLResponse, response.statusCode == 401 {
             if let protectionSpace = URLProtectionSpace.create(with: response) {
 
                 func proceed(proposing credential: URLCredential?) {
@@ -1247,6 +1250,38 @@ extension _ProtocolClient : URLProtocolClient {
     func urlProtocol(_ protocol: URLProtocol, didReceive challenge: URLAuthenticationChallenge) {
         guard let task = `protocol`.task else { fatalError("Received response, but there's no task.") }
         guard let session = task.session as? URLSession else { fatalError("Task not associated with URLSession.") }
+
+        // A custom protocol owns its challenge and the continuation behind its
+        // sender. Only a native protocol may replace itself for an HTTP retry.
+        if !(`protocol` is _NativeProtocol) {
+            @Sendable func answer(_ disposition: URLSession.AuthChallengeDisposition, _ credential: URLCredential?) {
+                guard task.state != .canceling && task.state != .completed,
+                      let sender = challenge.sender else { return }
+                switch disposition {
+                case .useCredential:
+                    if let credential {
+                        sender.use(credential, for: challenge)
+                    } else {
+                        sender.continueWithoutCredential(for: challenge)
+                    }
+                case .performDefaultHandling:
+                    sender.performDefaultHandling(for: challenge)
+                case .rejectProtectionSpace:
+                    sender.rejectProtectionSpaceAndContinue(with: challenge)
+                case .cancelAuthenticationChallenge:
+                    sender.cancel(challenge)
+                }
+            }
+
+            if let delegate = task.delegate {
+                session.delegateQueue.addOperation {
+                    delegate.urlSession(session, task: task, didReceive: challenge, completionHandler: answer)
+                }
+            } else {
+                answer(.performDefaultHandling, nil)
+            }
+            return
+        }
         
         @Sendable func proceed(using credential: URLCredential?) {
             let protectionSpace = challenge.protectionSpace
