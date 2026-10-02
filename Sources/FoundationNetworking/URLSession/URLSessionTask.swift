@@ -28,6 +28,46 @@ private class Bag<Element> {
 /// A cancelable object that refers to the lifetime
 /// of processing a given request.
 open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
+    /// Completion handler for `URLSessionDataTask` and `URLSessionUploadTask`.
+    typealias DataTaskCompletion = @Sendable (Data?, URLResponse?, Error?) -> Void
+    /// Completion handler for `URLSessionDownloadTask`.
+    typealias DownloadTaskCompletion = @Sendable (URL?, URLResponse?, Error?) -> Void
+
+    /// The aggregate completion callback, if this task has one.
+    enum Completion {
+        case data(DataTaskCompletion)
+        case download(DownloadTaskCompletion)
+    }
+
+    // Protocol callbacks may read this off the session work queue.
+    internal let completion: Completion?
+    internal let usesAsyncCompletion: Bool
+
+    /// Delegate-only tasks use their task delegate or the session delegate.
+    /// Async conveniences retain their task delegate for progress callbacks;
+    /// completion-handler tasks bypass ordinary data and task callbacks.
+    internal var callbackDelegate: URLSessionTaskDelegate? {
+        completion == nil ? effectiveDelegate : (usesAsyncCompletion ? delegate : nil)
+    }
+
+    /// Choose a delegate that can receive data callbacks. A task delegate
+    /// that does not conform to URLSessionDataDelegate leaves these callbacks
+    /// to the session's data delegate on delegate-only tasks.
+    internal var dataCallbackDelegate: URLSessionDataDelegate? {
+        guard callbackDelegate != nil else { return nil }
+        if completion == nil {
+            return (delegate as? URLSessionDataDelegate) ?? (actualSession?.delegate as? URLSessionDataDelegate)
+        }
+        return delegate as? URLSessionDataDelegate
+    }
+
+    internal var downloadCallbackDelegate: URLSessionDownloadDelegate? {
+        guard callbackDelegate != nil else { return nil }
+        if completion == nil {
+            return (delegate as? URLSessionDownloadDelegate) ?? (actualSession?.delegate as? URLSessionDownloadDelegate)
+        }
+        return delegate as? URLSessionDownloadDelegate
+    }
     
     // These properties aren't heeded in swift-corelibs-foundation, but we may heed them in the future. They exist for source compatibility.
     open var countOfBytesClientExpectsToReceive: Int64 = NSURLSessionTransferSizeUnknown {
@@ -100,10 +140,14 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     internal var session: URLSessionProtocol! //change to nil when task completes
 
     private var _taskDelegate: URLSessionTaskDelegate?
+    // Internal callbacks may use the session delegate when no task-specific
+    // delegate was supplied. Keep that policy separate from the public getter.
+    internal var effectiveDelegate: URLSessionTaskDelegate? {
+        _taskDelegate ?? (actualSession?.delegate as? URLSessionTaskDelegate)
+    }
     open var delegate: URLSessionTaskDelegate? {
         get {
-            if let _taskDelegate { return _taskDelegate }
-            return self.actualSession?.delegate as? URLSessionTaskDelegate
+            _taskDelegate
         }
         set {
             guard !self.hasTriggeredResume else {
@@ -113,8 +157,6 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
         }
     }
     
-    internal var _callCompletionHandlerInline = false
-
     fileprivate enum ProtocolState {
         case toBeCreated
         case awaitingCacheReply(Bag<(URLProtocol?) -> Void>)
@@ -124,6 +166,10 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     
     fileprivate let _protocolLock = NSLock() // protects:
     fileprivate var _protocolStorage: ProtocolState = .toBeCreated
+    // Redirect decisions and the limit belong to the task, not one protocol hop.
+    // These values are accessed only on workQueue.
+    fileprivate var pendingRedirectProtocol: URLProtocol?
+    fileprivate var redirectCount = 0
     internal    var _lastCredentialUsedFromStorageDuringAuthentication: (protectionSpace: URLProtectionSpace, credential: URLCredential)?
     
     private var _protocolClass: URLProtocol.Type? {
@@ -212,6 +258,45 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
         _protocolLock.performLocked {
             _protocolStorage = .invalidated
         }
+        workQueue.async { self.pendingRedirectProtocol = nil }
+    }
+
+    // Called on workQueue after the redirect delegate has chosen a request.
+    fileprivate func _followRedirect(to request: URLRequest, from oldProtocol: URLProtocol, client: _ProtocolClient) {
+        guard let session = actualSession else { return }
+        let configuredRequest = session._configuration.configure(request: request)
+
+        // Stop the old hop before making the next one visible. Its client must
+        // not deliver a late response or completion into the same task.
+        oldProtocol.client = nil
+        oldProtocol.stopLoading()
+        currentRequest = configuredRequest
+        response = nil
+        client.bodyChunks = []
+        client.cacheableResponse = nil
+
+        if let data = configuredRequest.httpBody {
+            knownBody = .data(createDispatchData(data))
+        } else if let stream = configuredRequest.httpBodyStream {
+            knownBody = .stream(stream)
+        } else {
+            knownBody = URLSessionTask._Body.none
+        }
+
+        _protocolLock.performLocked { _protocolStorage = .toBeCreated }
+        _getProtocol { nextProtocol in
+            nonisolated(unsafe) let nextProtocol = nextProtocol
+            self.workQueue.async {
+                guard self.state != .canceling && self.state != .completed else { return }
+                if let nextProtocol {
+                    nextProtocol.startLoading()
+                } else {
+                    let error = URLError(.unsupportedURL)
+                    self.error = error
+                    client.urlProtocol(task: self, didFailWithError: error)
+                }
+            }
+        }
     }
     
     
@@ -222,7 +307,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
             return
         }
         
-        if let session = actualSession, let delegate = self.delegate {
+        if let session = actualSession, let delegate = effectiveDelegate {
             nonisolated(unsafe) let nonisolatedCompletion = completion
             delegate.urlSession(session, task: self) { (stream) in
                 if let stream = stream {
@@ -257,31 +342,48 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
         originalRequest = nil
         knownBody = URLSessionTask._Body.none
         workQueue = DispatchQueue(label: "URLSessionTask.notused.0")
+        completion = nil
+        usesAsyncCompletion = false
         super.init()
     }
     /// Create a data task. If there is a httpBody in the URLRequest, use that as a parameter
-    internal convenience init(session: URLSession, request: URLRequest, taskIdentifier: Int) {
-        if let bodyData = request.httpBody, !bodyData.isEmpty {
-            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.data(createDispatchData(bodyData)))
-        } else if let bodyStream = request.httpBodyStream {
-            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.stream(bodyStream))
+    internal convenience init(session: URLSession, originalRequest: URLRequest, currentRequest: URLRequest, taskIdentifier: Int, completion: Completion?, taskDelegate: URLSessionTaskDelegate? = nil, usesAsyncCompletion: Bool = false) {
+        if let bodyData = currentRequest.httpBody, !bodyData.isEmpty {
+            self.init(session: session, originalRequest: originalRequest, currentRequest: currentRequest, taskIdentifier: taskIdentifier, body: _Body.data(createDispatchData(bodyData)), completion: completion, taskDelegate: taskDelegate, usesAsyncCompletion: usesAsyncCompletion)
+        } else if let bodyStream = currentRequest.httpBodyStream {
+            self.init(session: session, originalRequest: originalRequest, currentRequest: currentRequest, taskIdentifier: taskIdentifier, body: _Body.stream(bodyStream), completion: completion, taskDelegate: taskDelegate, usesAsyncCompletion: usesAsyncCompletion)
         } else {
-            self.init(session: session, request: request, taskIdentifier: taskIdentifier, body: _Body.none)
+            self.init(session: session, originalRequest: originalRequest, currentRequest: currentRequest, taskIdentifier: taskIdentifier, body: _Body.none, completion: completion, taskDelegate: taskDelegate, usesAsyncCompletion: usesAsyncCompletion)
         }
     }
 
-    internal init(session: URLSession, request: URLRequest, taskIdentifier: Int, body: _Body?) {
+    internal init(session: URLSession, originalRequest: URLRequest, currentRequest: URLRequest, taskIdentifier: Int, body: _Body?, completion: Completion?, taskDelegate: URLSessionTaskDelegate? = nil, usesAsyncCompletion: Bool = false) {
         self.session = session
         /* make sure we're actually having a serial queue as it's used for synchronization */
         self.workQueue = DispatchQueue.init(label: "org.swift.URLSessionTask.WorkQueue", target: session.workQueue)
         self.taskIdentifier = taskIdentifier
-        self.originalRequest = request
+        self.originalRequest = originalRequest
         self.knownBody = body
+        self.completion = completion
+        self.usesAsyncCompletion = usesAsyncCompletion
+        self._taskDelegate = taskDelegate
         super.init()
-        self.currentRequest = request
+        self.currentRequest = currentRequest
         self.progress.cancellationHandler = { [weak self] in
             self?.cancel()
         }
+    }
+
+    /// Create the placeholder task returned for unsupported resume data.
+    internal init(invalidResumeDataSession session: URLSession, taskIdentifier: Int, completion: Completion?) {
+        self.session = session
+        self.taskIdentifier = taskIdentifier
+        self.originalRequest = nil
+        self.knownBody = .none
+        self.workQueue = DispatchQueue(label: "URLSessionTask.notused.0")
+        self.completion = completion
+        self.usesAsyncCompletion = false
+        super.init()
     }
     deinit {
         //TODO: Do we remove the EasyHandle from the session here? This might run on the wrong thread / queue.
@@ -389,6 +491,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
                 return false
             }
             guard !canceled else { return }
+            self.pendingRedirectProtocol = nil
             self._getProtocol { (urlProtocol) in
                 // The combination of locking in getProtocol and dispatching to the work queue let us use the normally non-Sendable URLProtocol
                 nonisolated(unsafe) let urlProtocol = urlProtocol
@@ -1060,16 +1163,18 @@ extension _ProtocolClient : URLProtocolClient {
     func urlProtocol(_ protocol: URLProtocol, didReceive response: URLResponse, cacheStoragePolicy policy: URLCache.StoragePolicy) {
         guard let task = `protocol`.task else { fatalError("Received response, but there's no task.") }
         task.response = response
+        // A new response must not include bytes from an earlier attempt.
+        bodyChunks = []
         let session = task.session as! URLSession
         
         // Only cache data tasks:
         self.cachePolicy = policy
+        cacheableResponse = nil
         
         if session.configuration.urlCache != nil {
             switch policy {
             case .allowed: fallthrough
             case .allowedInMemoryOnly:
-                cacheableData = []
                 cacheableResponse = response
                 
             case .notAllowed:
@@ -1077,25 +1182,18 @@ extension _ProtocolClient : URLProtocolClient {
             }
         }
         
-        switch session.behaviour(for: task) {
-        case .taskDelegate(let delegate),
-                .dataCompletionHandlerWithTaskDelegate(_, let delegate),
-                .downloadCompletionHandlerWithTaskDelegate(_, let delegate):
-            if let dataDelegate = delegate as? URLSessionDataDelegate,
-               let dataTask = task as? URLSessionDataTask {
-                session.delegateQueue.addOperation {
-                    dataDelegate.urlSession(session, dataTask: dataTask, didReceive: response, completionHandler: { _ in
-                        URLSession.printDebug("warning: Ignoring disposition from completion handler.")
-                    })
-                }
-            } else if let webSocketDelegate = delegate as? URLSessionWebSocketDelegate,
-                      let webSocketTask = task as? URLSessionWebSocketTask {
-                session.delegateQueue.addOperation {
-                    webSocketDelegate.urlSession(session, webSocketTask: webSocketTask, didOpenWithProtocol: webSocketTask.protocolPicked)
-                }
+        if let dataDelegate = task.dataCallbackDelegate,
+           let dataTask = task as? URLSessionDataTask {
+            session.delegateQueue.addOperation {
+                dataDelegate.urlSession(session, dataTask: dataTask, didReceive: response, completionHandler: { _ in
+                    URLSession.printDebug("warning: Ignoring disposition from completion handler.")
+                })
             }
-        case .noDelegate, .dataCompletionHandler, .downloadCompletionHandler:
-            break
+        } else if let webSocketDelegate = task.callbackDelegate as? URLSessionWebSocketDelegate,
+                  let webSocketTask = task as? URLSessionWebSocketTask {
+            session.delegateQueue.addOperation {
+                webSocketDelegate.urlSession(session, webSocketTask: webSocketTask, didOpenWithProtocol: webSocketTask.protocolPicked)
+            }
         }
     }
 
@@ -1103,7 +1201,10 @@ extension _ProtocolClient : URLProtocolClient {
         guard let task = urlProtocol.task else { fatalError() }
         guard let session = task.session as? URLSession else { fatalError() }
         let urlResponse = task.response
-        if let response = urlResponse as? HTTPURLResponse, response.statusCode == 401 {
+        // Only native protocols turn an HTTP 401 response into a challenge.
+        // A custom protocol explicitly reports any challenge it wants to issue.
+        if urlProtocol is _NativeProtocol,
+           let response = urlResponse as? HTTPURLResponse, response.statusCode == 401 {
             if let protectionSpace = URLProtectionSpace.create(with: response) {
 
                 func proceed(proposing credential: URLCredential?) {
@@ -1146,20 +1247,20 @@ extension _ProtocolClient : URLProtocolClient {
     }
 
     private func completeTask(urlProtocol: URLProtocol, task: URLSessionTask, session: URLSession) {
+        let data = takeBodyData()
         if let storage = session.configuration.urlCredentialStorage,
            let last = task._protocolLock.performLocked({ task._lastCredentialUsedFromStorageDuringAuthentication }) {
             storage.set(last.credential, for: last.protectionSpace, task: task)
         }
         
         if let cache = session.configuration.urlCache,
-           let data = cacheableData,
            let response = cacheableResponse,
            let task = task as? URLSessionDataTask {
-            
-            let cacheable = CachedURLResponse(response: response, data: Data(data.joined()), storagePolicy: cachePolicy)
+
+            let cacheable = CachedURLResponse(response: response, data: data, storagePolicy: cachePolicy)
             let protocolAllows = (urlProtocol as? _NativeProtocol)?.canCache(cacheable) ?? false
             if protocolAllows {
-                if let delegate = task.delegate as? URLSessionDataDelegate {
+                if let delegate = task.effectiveDelegate as? URLSessionDataDelegate {
                     delegate.urlSession(task.session as! URLSession, dataTask: task, willCacheResponse: cacheable) { (actualCacheable) in
                         if let actualCacheable = actualCacheable {
                             cache.storeCachedResponse(actualCacheable, for: task)
@@ -1171,53 +1272,52 @@ extension _ProtocolClient : URLProtocolClient {
             }
         }
         
-        switch session.behaviour(for: task) {
-        case .taskDelegate(let delegate):
-            if let downloadDelegate = delegate as? URLSessionDownloadDelegate, let downloadTask = task as? URLSessionDownloadTask {
-                let temporaryFileURL = urlProtocol.properties[URLProtocol._PropertyKey.temporaryFileURL] as! URL
-                session.delegateQueue.addOperation {
-                    downloadDelegate.urlSession(session, downloadTask: downloadTask, didFinishDownloadingTo: temporaryFileURL)
+        switch task.completion {
+        case nil:
+            if let delegate = task.callbackDelegate {
+                if let downloadDelegate = task.downloadCallbackDelegate, let downloadTask = task as? URLSessionDownloadTask {
+                    let temporaryFileURL = urlProtocol.properties[URLProtocol._PropertyKey.temporaryFileURL] as! URL
+                    session.delegateQueue.addOperation {
+                        downloadDelegate.urlSession(session, downloadTask: downloadTask, didFinishDownloadingTo: temporaryFileURL)
+                    }
+                } else if let webSocketDelegate = delegate as? URLSessionWebSocketDelegate,
+                          let webSocketTask = task as? URLSessionWebSocketTask {
+                    session.delegateQueue.addOperation {
+                        webSocketDelegate.urlSession(session, webSocketTask: webSocketTask, didCloseWith: webSocketTask.closeCode, reason: webSocketTask.closeReason)
+                    }
                 }
-            } else if let webSocketDelegate = delegate as? URLSessionWebSocketDelegate,
-                      let webSocketTask = task as? URLSessionWebSocketTask {
                 session.delegateQueue.addOperation {
-                    webSocketDelegate.urlSession(session, webSocketTask: webSocketTask, didCloseWith: webSocketTask.closeCode, reason: webSocketTask.closeReason)
+                    guard task.state != .completed else { return }
+                    delegate.urlSession(session, task: task, didCompleteWithError: nil)
+                    task.state = .completed
+                    session.workQueue.async {
+                        session.taskRegistry.remove(task)
+                    }
                 }
-            }
-            session.delegateQueue.addOperation {
-                guard task.state != .completed else { return }
-                delegate.urlSession(session, task: task, didCompleteWithError: nil)
+            } else {
+                guard task.state != .completed else { break }
                 task.state = .completed
                 session.workQueue.async {
                     session.taskRegistry.remove(task)
                 }
             }
-        case .noDelegate:
-            guard task.state != .completed else { break }
-            task.state = .completed
-            session.workQueue.async {
-                session.taskRegistry.remove(task)
-            }
-        case .dataCompletionHandler(let completion),
-             .dataCompletionHandlerWithTaskDelegate(let completion, _):
-            nonisolated(unsafe) let nonisolatedURLProtocol = urlProtocol
+        case .data(let completion):
             let dataCompletion : @Sendable () -> () = {
                 guard task.state != .completed else { return }
-                completion(nonisolatedURLProtocol.properties[URLProtocol._PropertyKey.responseData] as? Data ?? Data(), task.response, nil)
+                completion(data, task.response, nil)
                 task.state = .completed
                 session.workQueue.async {
                     session.taskRegistry.remove(task)
                 }
             }
-            if task._callCompletionHandlerInline {
+            if task.usesAsyncCompletion {
                 dataCompletion()
             } else {
                 session.delegateQueue.addOperation {
                     dataCompletion()
                 }
             }
-        case .downloadCompletionHandler(let completion),
-             .downloadCompletionHandlerWithTaskDelegate(let completion, _):
+        case .download(let completion):
             nonisolated(unsafe) let nonisolatedURLProtocol = urlProtocol
             let downloadCompletion : @Sendable () -> () = {
                 guard task.state != .completed else { return }
@@ -1227,7 +1327,7 @@ extension _ProtocolClient : URLProtocolClient {
                     session.taskRegistry.remove(task)
                 }
             }
-            if task._callCompletionHandlerInline {
+            if task.usesAsyncCompletion {
                 downloadCompletion()
             } else {
                 session.delegateQueue.addOperation {
@@ -1247,6 +1347,38 @@ extension _ProtocolClient : URLProtocolClient {
     func urlProtocol(_ protocol: URLProtocol, didReceive challenge: URLAuthenticationChallenge) {
         guard let task = `protocol`.task else { fatalError("Received response, but there's no task.") }
         guard let session = task.session as? URLSession else { fatalError("Task not associated with URLSession.") }
+
+        // A custom protocol owns its challenge and the continuation behind its
+        // sender. Only a native protocol may replace itself for an HTTP retry.
+        if !(`protocol` is _NativeProtocol) {
+            @Sendable func answer(_ disposition: URLSession.AuthChallengeDisposition, _ credential: URLCredential?) {
+                guard task.state != .canceling && task.state != .completed,
+                      let sender = challenge.sender else { return }
+                switch disposition {
+                case .useCredential:
+                    if let credential {
+                        sender.use(credential, for: challenge)
+                    } else {
+                        sender.continueWithoutCredential(for: challenge)
+                    }
+                case .performDefaultHandling:
+                    sender.performDefaultHandling(for: challenge)
+                case .rejectProtectionSpace:
+                    sender.rejectProtectionSpaceAndContinue(with: challenge)
+                case .cancelAuthenticationChallenge:
+                    sender.cancel(challenge)
+                }
+            }
+
+            if let delegate = task.effectiveDelegate {
+                session.delegateQueue.addOperation {
+                    delegate.urlSession(session, task: task, didReceive: challenge, completionHandler: answer)
+                }
+            } else {
+                answer(.performDefaultHandling, nil)
+            }
+            return
+        }
         
         @Sendable func proceed(using credential: URLCredential?) {
             let protectionSpace = challenge.protectionSpace
@@ -1286,7 +1418,7 @@ extension _ProtocolClient : URLProtocolClient {
             }
         }
         
-        if let delegate = task.delegate {
+        if let delegate = task.effectiveDelegate {
             session.delegateQueue.addOperation {
                 delegate.urlSession(session, task: task, didReceive: challenge) { disposition, credential in
                     
@@ -1312,27 +1444,24 @@ extension _ProtocolClient : URLProtocolClient {
     }
 
     func urlProtocol(_ protocol: URLProtocol, didLoad data: Data) {
-        `protocol`.properties[.responseData] = data
         guard let task = `protocol`.task else { fatalError() }
         guard let session = task.session as? URLSession else { fatalError() }
-        
-        switch cachePolicy {
-        case .allowed: fallthrough
-        case .allowedInMemoryOnly:
-            cacheableData?.append(data)
 
-        case .notAllowed:
-            break
+        let returnsData: Bool
+        if case .data = task.completion {
+            returnsData = true
+        } else {
+            returnsData = false
         }
-        
-        switch session.behaviour(for: task) {
-        case .taskDelegate(let delegate):
-            let dataDelegate = delegate as? URLSessionDataDelegate
+        if !data.isEmpty && (returnsData || cacheableResponse != nil) {
+            bodyChunks.append(data)
+        }
+
+        if case nil = task.completion, let dataDelegate = task.dataCallbackDelegate {
             let dataTask = task as? URLSessionDataTask
             session.delegateQueue.addOperation {
-                dataDelegate?.urlSession(session, dataTask: dataTask!, didReceive: data)
+                dataDelegate.urlSession(session, dataTask: dataTask!, didReceive: data)
             }
-        default: return
         }
     }
 
@@ -1343,24 +1472,27 @@ extension _ProtocolClient : URLProtocolClient {
 
     func urlProtocol(task: URLSessionTask, didFailWithError error: Error) {
         guard let session = task.session as? URLSession else { fatalError() }
-        switch session.behaviour(for: task) {
-        case .taskDelegate(let delegate):
-            session.delegateQueue.addOperation {
-                guard task.state != .completed else { return }
-                delegate.urlSession(session, task: task, didCompleteWithError: error as Error)
+        bodyChunks = []
+        cacheableResponse = nil
+        switch task.completion {
+        case nil:
+            if let delegate = task.callbackDelegate {
+                session.delegateQueue.addOperation {
+                    guard task.state != .completed else { return }
+                    delegate.urlSession(session, task: task, didCompleteWithError: error as Error)
+                    task.state = .completed
+                    session.workQueue.async {
+                        session.taskRegistry.remove(task)
+                    }
+                }
+            } else {
+                guard task.state != .completed else { break }
                 task.state = .completed
                 session.workQueue.async {
                     session.taskRegistry.remove(task)
                 }
             }
-        case .noDelegate:
-            guard task.state != .completed else { break }
-            task.state = .completed
-            session.workQueue.async {
-                session.taskRegistry.remove(task)
-            }
-        case .dataCompletionHandler(let completion),
-             .dataCompletionHandlerWithTaskDelegate(let completion, _):
+        case .data(let completion):
             let dataCompletion : @Sendable () -> () = {
                 guard task.state != .completed else { return }
                 completion(nil, nil, error)
@@ -1369,15 +1501,14 @@ extension _ProtocolClient : URLProtocolClient {
                     session.taskRegistry.remove(task)
                 }
             }
-            if task._callCompletionHandlerInline {
+            if task.usesAsyncCompletion {
                 dataCompletion()
             } else {
                 session.delegateQueue.addOperation {
                     dataCompletion()
                 }
             }
-        case .downloadCompletionHandler(let completion),
-             .downloadCompletionHandlerWithTaskDelegate(let completion, _):
+        case .download(let completion):
             let downloadCompletion : @Sendable () -> () = {
                 guard task.state != .completed else { return }
                 completion(nil, nil, error)
@@ -1386,7 +1517,7 @@ extension _ProtocolClient : URLProtocolClient {
                     session.taskRegistry.remove(task)
                 }
             }
-            if task._callCompletionHandlerInline {
+            if task.usesAsyncCompletion {
                 downloadCompletion()
             } else {
                 session.delegateQueue.addOperation {
@@ -1400,7 +1531,54 @@ extension _ProtocolClient : URLProtocolClient {
     func urlProtocol(_ protocol: URLProtocol, cachedResponseIsValid cachedResponse: CachedURLResponse) {}
 
     func urlProtocol(_ protocol: URLProtocol, wasRedirectedTo request: URLRequest, redirectResponse: URLResponse) {
-        fatalError("The URLSession swift-corelibs-foundation implementation doesn't currently handle redirects directly.")
+        guard let task = `protocol`.task, let session = task.actualSession else { return }
+        nonisolated(unsafe) let redirectingProtocol = `protocol`
+        task.workQueue.async {
+            guard task.state != .canceling && task.state != .completed else { return }
+            let isCurrent = task._protocolLock.performLocked { () -> Bool in
+                guard case .existing(let current) = task._protocolStorage else { return false }
+                return current === redirectingProtocol
+            }
+            guard isCurrent, task.pendingRedirectProtocol == nil else { return }
+
+            task.redirectCount += 1
+            if task.redirectCount > 20 {
+                let error = URLError(.httpTooManyRedirects)
+                task.error = error
+                redirectingProtocol.client = nil
+                redirectingProtocol.stopLoading()
+                self.urlProtocol(task: task, didFailWithError: error)
+                return
+            }
+
+            task.pendingRedirectProtocol = redirectingProtocol
+            @Sendable func decide(_ chosenRequest: URLRequest?) {
+                task.workQueue.async {
+                    guard task.pendingRedirectProtocol === redirectingProtocol else { return }
+                    task.pendingRedirectProtocol = nil
+                    guard task.state != .canceling && task.state != .completed else { return }
+                    let isCurrent = task._protocolLock.performLocked { () -> Bool in
+                        guard case .existing(let current) = task._protocolStorage else { return false }
+                        return current === redirectingProtocol
+                    }
+                    guard isCurrent else { return }
+                    if let chosenRequest {
+                        task._followRedirect(to: chosenRequest, from: redirectingProtocol, client: self)
+                    }
+                    // A nil decision leaves the current protocol responsible
+                    // for delivering the redirect response and its body.
+                }
+            }
+
+            if let delegate = task.effectiveDelegate, let response = redirectResponse as? HTTPURLResponse {
+                session.delegateQueue.addOperation {
+                    delegate.urlSession(session, task: task, willPerformHTTPRedirection: response, newRequest: request,
+                                        completionHandler: decide)
+                }
+            } else {
+                decide(request)
+            }
+        }
     }
 }
 extension URLSessionTask {
@@ -1420,7 +1598,7 @@ extension URLSessionTask {
         let user = credential?.user ?? ""
         let password = credential?.password ?? ""
         let encodedString = "\(user):\(password)".data(using: .utf8)?.base64EncodedString()
-        task.authRequest = task.originalRequest
+        task.authRequest = task.currentRequest
         task.authRequest?.setValue("Basic \(encodedString!)", forHTTPHeaderField: "Authorization")
     }
 
@@ -1431,7 +1609,6 @@ extension URLSessionTask {
 
 extension URLProtocol {
     enum _PropertyKey: String, Sendable {
-        case responseData
         case temporaryFileURL
     }
 }
