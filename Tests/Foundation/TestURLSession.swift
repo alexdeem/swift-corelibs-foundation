@@ -15,6 +15,51 @@
     #endif
 #endif
 
+import Synchronization
+
+private final class TaskCreationRecorder: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    struct Event: Sendable {
+        let task: URLSessionTask
+        let state: URLSessionTask.State
+    }
+
+    let events = Mutex<[Event]>([])
+    let replacement: URLSessionTaskDelegate?
+    let cancelOnCreation: Bool
+
+    init(replacement: URLSessionTaskDelegate? = nil, cancelOnCreation: Bool = false) {
+        self.replacement = replacement
+        self.cancelOnCreation = cancelOnCreation
+    }
+
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+        events.withLock { $0.append(Event(task: task, state: task.state)) }
+        if let replacement {
+            task.delegate = replacement
+        }
+        if cancelOnCreation {
+            task.cancel()
+        }
+    }
+}
+
+private final class TaskCreationProbeProtocol: URLProtocol {
+    static let starts = Mutex(0)
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "task-creation.invalid"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.starts.withLock { $0 += 1 }
+        client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+    }
+
+    override func stopLoading() { }
+}
+
 @MainActor
 final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
 
@@ -143,6 +188,7 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
             
             public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
                 defer { expectation.fulfill() }
+                XCTAssertTrue(dataTask.delegate === self)
                 capital = String(data: data, encoding: .utf8)!
             }
         }
@@ -376,6 +422,7 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
             var totalBytesWritten = Int64(0)
             public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
                                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) -> Void {
+                XCTAssertTrue(downloadTask.delegate === self)
                 self.totalBytesWritten = totalBytesWritten
                 expectation.fulfill()
             }
@@ -612,6 +659,40 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         waitForExpectations(timeout: 30)
     }
     
+    func test_httpAdditionalHeadersOnRedirects() async {
+        let url = URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/redirectToEchoHeaders")!
+
+        for delegateSuppliesRequest in [false, true] {
+            let config = URLSessionConfiguration.ephemeral
+            config.httpAdditionalHeaders = ["X-Session": "configured", "x-override": "configuration"]
+            let delegate = SessionDelegate()
+            if delegateSuppliesRequest {
+                delegate.redirectionHandler = { _, request, completionHandler in
+                    var replacement = URLRequest(url: request.url!)
+                    replacement.setValue("delegate", forHTTPHeaderField: "X-Override")
+                    completionHandler(replacement)
+                }
+            }
+            let session = URLSession(configuration: config, delegate: delegateSuppliesRequest ? delegate : nil, delegateQueue: nil)
+            let expect = expectation(description: "Redirect with delegate-supplied request: \(delegateSuppliesRequest)")
+            var request = URLRequest(url: url)
+            request.setValue("caller", forHTTPHeaderField: "X-Override")
+            let task = session.dataTask(with: request) { data, _, error in
+                defer { expect.fulfill() }
+                XCTAssertNil(error)
+                let headers = String(decoding: data ?? Data(), as: UTF8.self).lowercased()
+                XCTAssertTrue(headers.contains("x-session: configured"))
+                let expectedOverride = delegateSuppliesRequest ? "delegate" : "caller"
+                XCTAssertTrue(headers.contains("x-override: \(expectedOverride)"))
+                XCTAssertFalse(headers.contains("x-override: configuration"))
+                XCTAssertTrue(headers.contains("cookie: redirect=true"))
+            }
+            task.resume()
+            waitForExpectations(timeout: 5)
+            session.invalidateAndCancel()
+        }
+    }
+
     func test_taskTimeout() async {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 5
@@ -1602,6 +1683,47 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         waitForExpectations(timeout: 30)
     }
 
+    func test_sessionDelegateRedirectAppliesCookiesToFreshRequest() async {
+        let config = URLSessionConfiguration.ephemeral
+        let delegate = SessionDelegate()
+        delegate.redirectionHandler = { _, request, completionHandler in
+            completionHandler(URLRequest(url: request.url!))
+        }
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+
+        let url = URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/redirectToEchoHeaders")!
+        let expect = expectation(description: "Delegate redirect applies the cookie from the response")
+        let task = session.dataTask(with: url) { data, _, error in
+            defer { expect.fulfill() }
+            XCTAssertNil(error)
+            let headers = String(decoding: data ?? Data(), as: UTF8.self)
+            XCTAssertTrue(headers.contains("Cookie: redirect=true"))
+        }
+        task.resume()
+        waitForExpectations(timeout: 5)
+    }
+
+    func test_taskDelegateRedirectAppliesCookies() async {
+        final class EmptyTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable { }
+
+        let config = URLSessionConfiguration.ephemeral
+        let session = URLSession(configuration: config, delegate: nil, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+
+        let url = URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/redirectToEchoHeaders")!
+        let expect = expectation(description: "Task delegate redirect applies the cookie from the response")
+        let task = session.dataTask(with: url) { data, _, error in
+            defer { expect.fulfill() }
+            XCTAssertNil(error)
+            let headers = String(decoding: data ?? Data(), as: UTF8.self)
+            XCTAssertTrue(headers.contains("Cookie: redirect=true"))
+        }
+        task.delegate = EmptyTaskDelegate()
+        task.resume()
+        waitForExpectations(timeout: 5)
+    }
+
     func test_previouslySetCookiesAreSentInLaterRequests() async {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 5
@@ -1872,6 +1994,139 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         XCTAssertNil(session.delegate)
     }
 
+    #if NS_FOUNDATION_ALLOWS_TESTABLE_IMPORT
+    func test_getAllTasksSnapshotsBeforeDelegateQueueRuns() async throws {
+        let delegateQueue = OperationQueue()
+        delegateQueue.maxConcurrentOperationCount = 1
+        let releaseDelegateQueue = DispatchSemaphore(value: 0)
+        let delegateQueueBlocked = expectation(description: "delegate queue is blocked")
+        delegateQueue.addOperation {
+            delegateQueueBlocked.fulfill()
+            releaseDelegateQueue.wait()
+        }
+        defer { releaseDelegateQueue.signal() }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PausedTaskProtocol.self]
+        let session = URLSession(configuration: configuration, delegate: nil, delegateQueue: delegateQueue)
+        let task = session.dataTask(with: try XCTUnwrap(URL(string: "paused-task://example")))
+        task.resume()
+        await fulfillment(of: [delegateQueueBlocked], timeout: 5)
+
+        let result = expectation(description: "task snapshot delivered")
+        session.getAllTasks { tasks in
+            XCTAssertEqual(tasks.map(\.taskIdentifier), [task.taskIdentifier])
+            result.fulfill()
+        }
+        session.workQueue.sync {} // Wait until the snapshot is made.
+        task.cancel()
+        task.workQueue.sync {} // The task has left the running state.
+        releaseDelegateQueue.signal()
+        await fulfillment(of: [result], timeout: 5)
+    }
+
+    func test_getTasksWithCompletionHandlerSnapshotsBeforeDelegateQueueRuns() async throws {
+        let delegateQueue = OperationQueue()
+        delegateQueue.maxConcurrentOperationCount = 1
+        let releaseDelegateQueue = DispatchSemaphore(value: 0)
+        let delegateQueueBlocked = expectation(description: "delegate queue is blocked")
+        delegateQueue.addOperation {
+            delegateQueueBlocked.fulfill()
+            releaseDelegateQueue.wait()
+        }
+        defer { releaseDelegateQueue.signal() }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PausedTaskProtocol.self]
+        let session = URLSession(configuration: configuration, delegate: nil, delegateQueue: delegateQueue)
+        let task = session.dataTask(with: try XCTUnwrap(URL(string: "paused-task://example")))
+        task.resume()
+        await fulfillment(of: [delegateQueueBlocked], timeout: 5)
+
+        let result = expectation(description: "categorized task snapshot delivered")
+        session.getTasksWithCompletionHandler { dataTasks, uploadTasks, downloadTasks in
+            XCTAssertEqual(dataTasks.map(\.taskIdentifier), [task.taskIdentifier])
+            XCTAssertTrue(uploadTasks.isEmpty)
+            XCTAssertTrue(downloadTasks.isEmpty)
+            result.fulfill()
+        }
+        session.workQueue.sync {} // Wait until the snapshot is made.
+        task.cancel()
+        task.workQueue.sync {} // The task has left the running state.
+        releaseDelegateQueue.signal()
+        await fulfillment(of: [result], timeout: 5)
+    }
+
+    func test_invalidateAndCancelCancelsAllRegisteredTasks() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PausedTaskProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let url = try XCTUnwrap(URL(string: "paused-task://example"))
+        let completions = (0..<3).map { index in
+            expectation(description: "task \(index) cancelled")
+        }
+        let tasks = completions.map { completion in
+            session.dataTask(with: url) { _, _, error in
+                XCTAssertEqual((error as? URLError)?.code, .cancelled)
+                completion.fulfill()
+            }
+        }
+        tasks.forEach { $0.resume() }
+
+        session.invalidateAndCancel()
+        await fulfillment(of: completions, timeout: 5)
+        XCTAssertTrue(tasks.allSatisfy { $0.state == .completed })
+    }
+
+    func test_taskCompletionCanBeReadOutsideSessionWorkQueue() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PausedTaskProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let task = session.dataTask(with: try XCTUnwrap(URL(string: "paused-task://example"))) { _, _, _ in }
+        let result = expectation(description: "behavior read on an independent queue")
+
+        DispatchQueue.global().async {
+            switch task.completion {
+            case .data:
+                break
+            default:
+                XCTFail("Expected the task's data completion")
+            }
+            result.fulfill()
+        }
+
+        await fulfillment(of: [result], timeout: 5)
+        task.cancel()
+    }
+
+    func test_taskBehaviourRetainsCompletionCaptureAfterCompletion() async throws {
+        final class Capture: Sendable {}
+
+        let session = URLSession(configuration: .ephemeral)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/Nepal"))
+        let completion = expectation(description: "task completed")
+        weak var weakCapture: Capture?
+
+        func createTask() -> URLSessionDataTask {
+            let capture = Capture()
+            weakCapture = capture
+            return session.dataTask(with: url) { [capture] _, _, _ in
+                _ = capture
+                completion.fulfill()
+            }
+        }
+
+        let task = createTask()
+        XCTAssertNotNil(weakCapture)
+        task.resume()
+        await fulfillment(of: [completion], timeout: 5)
+        session.workQueue.sync {} // Wait until the task is removed from the registry.
+        withExtendedLifetime(task) {
+            XCTAssertNotNil(weakCapture)
+        }
+    }
+    #endif
+
     func test_sessionDelegateCalledIfTaskDelegateDoesNotImplement() async throws {
         let expectation = XCTestExpectation(description: "task finished")
         let delegate = SessionDelegate(with: expectation)
@@ -1885,6 +2140,256 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         task.resume()
 
         await fulfillment(of: [expectation], timeout: 5)
+    }
+
+    func test_taskDelegateGetterDoesNotReturnSessionDelegate() throws {
+        final class EmptySessionDelegate: NSObject, URLSessionTaskDelegate, Sendable {}
+        let sessionDelegate = EmptySessionDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: sessionDelegate, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/country.txt"))
+        let task = session.dataTask(with: url)
+
+        XCTAssertNil(task.delegate)
+        final class EmptyTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable {}
+        let taskDelegate = EmptyTaskDelegate()
+        task.delegate = taskDelegate
+        XCTAssertTrue(task.delegate === taskDelegate)
+        task.cancel()
+    }
+
+    func test_taskDelegateSetterReceivesDataCallbacks() async throws {
+        final class RecordingDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+            let completion: XCTestExpectation
+            var receivedData = false
+
+            init(completion: XCTestExpectation) {
+                self.completion = completion
+            }
+
+            func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                receivedData = true
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                XCTAssertNil(error)
+                XCTAssertTrue(receivedData)
+                completion.fulfill()
+            }
+        }
+
+        let completion = expectation(description: "task-specific delegate completed")
+        let delegate = RecordingDelegate(completion: completion)
+        let session = URLSession(configuration: .ephemeral)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/UK"))
+        let task = session.dataTask(with: url)
+        task.delegate = delegate
+        task.resume()
+
+        await fulfillment(of: [completion], timeout: 5)
+    }
+
+    func test_sessionDataDelegateReceivesMethodsMissingFromTaskDelegate() async throws {
+        final class SessionDataDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+            let completion: XCTestExpectation
+            var body = Data()
+
+            init(completion: XCTestExpectation) { self.completion = completion }
+
+            func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                body.append(data)
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                XCTAssertNil(error)
+                XCTAssertEqual(String(decoding: body, as: UTF8.self), "London")
+                completion.fulfill()
+            }
+        }
+
+        final class EmptyTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable {}
+
+        let completion = expectation(description: "session delegate received task callbacks")
+        let delegate = SessionDataDelegate(completion: completion)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/UK"))
+        let task = session.dataTask(with: url)
+        task.delegate = EmptyTaskDelegate()
+        task.resume()
+
+        await fulfillment(of: [completion], timeout: 5)
+    }
+
+    func test_taskDataDelegateDefaultForwardsBodyToSessionDelegate() async throws {
+        final class SessionDataDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+            let completion: XCTestExpectation
+            var body = Data()
+
+            init(completion: XCTestExpectation) { self.completion = completion }
+
+            func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                body.append(data)
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                XCTAssertNil(error)
+                XCTAssertEqual(String(decoding: body, as: UTF8.self), "London")
+                completion.fulfill()
+            }
+        }
+
+        final class TaskDataDelegate: NSObject, URLSessionDataDelegate, Sendable {
+            func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                            didReceive response: URLResponse,
+                            completionHandler: @Sendable @escaping (URLSession.ResponseDisposition) -> Void) {
+                completionHandler(.allow)
+            }
+        }
+
+        let completion = expectation(description: "session delegate received unhandled body")
+        let delegate = SessionDataDelegate(completion: completion)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/UK"))
+        let task = session.dataTask(with: url)
+        task.delegate = TaskDataDelegate()
+        task.resume()
+
+        await fulfillment(of: [completion], timeout: 5)
+    }
+
+    func test_sessionDownloadDelegateReceivesMethodsMissingFromTaskDelegate() async throws {
+        final class SessionDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+            let completion: XCTestExpectation
+            var downloadedBody: String?
+
+            init(completion: XCTestExpectation) { self.completion = completion }
+
+            func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+                downloadedBody = (try? String(contentsOf: location, encoding: .utf8))
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                XCTAssertNil(error)
+                XCTAssertEqual(downloadedBody, "London")
+                completion.fulfill()
+            }
+        }
+
+        final class EmptyTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable {}
+
+        let completion = expectation(description: "session download delegate completed")
+        let delegate = SessionDownloadDelegate(completion: completion)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/UK"))
+        let task = session.downloadTask(with: url)
+        task.delegate = EmptyTaskDelegate()
+        task.resume()
+
+        await fulfillment(of: [completion], timeout: 5)
+    }
+
+    func test_dataCompletionDoesNotDeliverBodyToSessionDelegate() async throws {
+        final class RecordingDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+            var receivedData = false
+
+            func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                receivedData = true
+            }
+        }
+
+        let delegate = RecordingDelegate()
+        let taskDelegate = RecordingDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/UK"))
+        let completion = expectation(description: "data completion called")
+        let task = session.dataTask(with: url) { data, _, error in
+            XCTAssertNil(error)
+            XCTAssertNotNil(data)
+            XCTAssertFalse(delegate.receivedData)
+            XCTAssertFalse(taskDelegate.receivedData)
+            completion.fulfill()
+        }
+        task.delegate = taskDelegate
+        task.resume()
+
+        await fulfillment(of: [completion], timeout: 5)
+    }
+
+    func test_didCreateTaskRunsBeforeFactoriesReturn() throws {
+        let recorder = TaskCreationRecorder()
+        let delegateQueue = OperationQueue()
+        delegateQueue.isSuspended = true
+        let session = URLSession(configuration: .ephemeral, delegate: recorder, delegateQueue: delegateQueue)
+        let url = try XCTUnwrap(URL(string: "http://task-creation.invalid/request"))
+        let webSocketURL = try XCTUnwrap(URL(string: "ws://task-creation.invalid/socket"))
+
+        let tasks: [URLSessionTask] = [
+            session.dataTask(with: url),
+            session.dataTask(with: url) { _, _, _ in },
+            session.uploadTask(with: URLRequest(url: url), from: Data()),
+            session.downloadTask(with: url),
+            session.downloadTask(withResumeData: Data()),
+            session.webSocketTask(with: webSocketURL),
+        ]
+
+        let events = recorder.events.withLock { $0 }
+        XCTAssertEqual(events.count, tasks.count)
+        for (event, task) in zip(events, tasks) {
+            XCTAssertTrue(event.task === task)
+            XCTAssertEqual(event.state, .suspended)
+        }
+
+        delegateQueue.isSuspended = false
+        session.invalidateAndCancel()
+    }
+
+    func test_didCreateTaskCanInstallTaskDelegate() throws {
+        final class ReplacementDelegate: NSObject, URLSessionTaskDelegate, Sendable { }
+
+        let replacement = ReplacementDelegate()
+        let recorder = TaskCreationRecorder(replacement: replacement)
+        let session = URLSession(configuration: .ephemeral, delegate: recorder, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://task-creation.invalid/request"))
+
+        let task = session.dataTask(with: url)
+        XCTAssertTrue(recorder.events.withLock { $0.first?.task === task })
+        XCTAssertTrue(task.delegate === replacement)
+        session.invalidateAndCancel()
+    }
+
+    func test_didCreateTaskCanCancelBeforeLoading() async throws {
+        TaskCreationProbeProtocol.starts.withLock { $0 = 0 }
+        let recorder = TaskCreationRecorder(cancelOnCreation: true)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TaskCreationProbeProtocol.self]
+        let session = URLSession(configuration: configuration, delegate: recorder, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://task-creation.invalid/request"))
+        let completed = expectation(description: "task cancelled before loading")
+
+        let task = session.dataTask(with: url) { _, _, error in
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+            completed.fulfill()
+        }
+        XCTAssertTrue(recorder.events.withLock { $0.first?.task === task })
+        task.resume()
+
+        await fulfillment(of: [completed], timeout: 5)
+        XCTAssertEqual(TaskCreationProbeProtocol.starts.withLock { $0 }, 0)
+        session.invalidateAndCancel()
+    }
+
+    func test_didCreateTaskObservesAsyncDataTask() async throws {
+        guard #available(macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0, *) else { return }
+        let recorder = TaskCreationRecorder()
+        let session = URLSession(configuration: .ephemeral, delegate: recorder, delegateQueue: nil)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/USA"))
+
+        let (data, _) = try await session.data(from: url, delegate: nil)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "Washington, D.C.")
+        let events = recorder.events.withLock { $0 }
+        XCTAssertEqual(events.count, 1)
+        XCTAssertTrue(events.first?.task is URLSessionDataTask)
+        XCTAssertEqual(events.first?.state, .suspended)
+        session.invalidateAndCancel()
     }
 
     func test_getAllTasks() async throws {
@@ -2892,6 +3397,23 @@ extension DownloadTask : URLSessionTaskDelegate {
             XCTAssertEqual(e.code, .timedOut, "Unexpected error code")
         }
     }
+}
+
+private class PausedTaskProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.scheme == "paused-task"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override class func canInit(with task: URLSessionTask) -> Bool {
+        task.currentRequest?.url?.scheme == "paused-task"
+    }
+
+    override func startLoading() {}
+    override func stopLoading() {}
 }
 
 class FailFastProtocol: URLProtocol {

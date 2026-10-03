@@ -94,6 +94,12 @@ extension URLSessionDelegate {
  * Messages related to the operation of a specific task.
  */
 public protocol URLSessionTaskDelegate : URLSessionDelegate, Sendable {
+
+    /// Notifies the session delegate when a task is created. This callback runs
+    /// synchronously before the task creation method returns, rather than on
+    /// the session's delegate queue, so the delegate can configure the task
+    /// before it is resumed.
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask)
     
     /* An HTTP request is attempting to perform a redirection to a different
      * URL. You must invoke the completion routine to allow the
@@ -135,6 +141,8 @@ public protocol URLSessionTaskDelegate : URLSessionDelegate, Sendable {
 }
 
 extension URLSessionTaskDelegate {
+    public func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) { }
+
     public func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @Sendable @escaping (URLRequest?) -> Void) {
         // If the task's delegate does not implement this function, check if the session's delegate does
         if self === task.delegate, let sessionDelegate = session.delegate as? URLSessionTaskDelegate, self !== sessionDelegate {
@@ -258,7 +266,11 @@ extension URLSessionDataDelegate {
     
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didBecome streamTask: URLSessionStreamTask) { }
     
-    public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) { }
+    public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if self === dataTask.delegate, let sessionDelegate = session.delegate as? URLSessionDataDelegate, self !== sessionDelegate {
+            sessionDelegate.urlSession(session, dataTask: dataTask, didReceive: data)
+        }
+    }
     
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, willCacheResponse proposedResponse: CachedURLResponse, completionHandler: @Sendable @escaping (CachedURLResponse?) -> Void) {
         if self === dataTask.delegate, let sessionDelegate = session.delegate as? URLSessionDataDelegate, self !== sessionDelegate {
@@ -294,9 +306,17 @@ public protocol URLSessionDownloadDelegate : URLSessionTaskDelegate {
 }
 
 extension URLSessionDownloadDelegate {
-    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) { }
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        if self === downloadTask.delegate, let sessionDelegate = session.delegate as? URLSessionDownloadDelegate, self !== sessionDelegate {
+            sessionDelegate.urlSession(session, downloadTask: downloadTask, didWriteData: bytesWritten, totalBytesWritten: totalBytesWritten, totalBytesExpectedToWrite: totalBytesExpectedToWrite)
+        }
+    }
     
-    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) { }
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) {
+        if self === downloadTask.delegate, let sessionDelegate = session.delegate as? URLSessionDownloadDelegate, self !== sessionDelegate {
+            sessionDelegate.urlSession(session, downloadTask: downloadTask, didResumeAtOffset: fileOffset, expectedTotalBytes: expectedTotalBytes)
+        }
+    }
 }
 
 public protocol URLSessionStreamDelegate : URLSessionTaskDelegate {

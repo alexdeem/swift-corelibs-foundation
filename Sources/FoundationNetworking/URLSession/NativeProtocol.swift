@@ -42,7 +42,7 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
 
     public required init(task: URLSessionTask, cachedResponse: CachedURLResponse?, client: URLProtocolClient?) {
         self.internalState = .initial
-        super.init(request: task.originalRequest!, cachedResponse: cachedResponse, client: client)
+        super.init(request: task.currentRequest!, cachedResponse: cachedResponse, client: client)
         self.task = task
         self.easyHandle = _EasyHandle(delegate: self)
     }
@@ -131,33 +131,26 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         guard let task = self.task, let session = task.session as? URLSession else {
             fatalError("Cannot notify")
         }
-        switch task.session.behaviour(for: task) {
-        case .taskDelegate(let delegate),
-             .dataCompletionHandlerWithTaskDelegate(_, let delegate),
-             .downloadCompletionHandlerWithTaskDelegate(_, let delegate):
-            if let dataDelegate = delegate as? URLSessionDataDelegate,
-               let dataTask = task as? URLSessionDataTask {
-                session.delegateQueue.addOperation {
-                    dataDelegate.urlSession(session, dataTask: dataTask, didReceive: data)
-                }
-            } else if let downloadDelegate = delegate as? URLSessionDownloadDelegate,
-                      let downloadTask = task as? URLSessionDownloadTask {
-                let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
-                _ = fileHandle.seekToEndOfFile()
-                fileHandle.write(data)
-                task.countOfBytesReceived  += Int64(data.count)
-                session.delegateQueue.addOperation {
-                    downloadDelegate.urlSession(
-                        session,
-                        downloadTask: downloadTask,
-                        didWriteData: Int64(data.count),
-                        totalBytesWritten: task.countOfBytesReceived,
-                        totalBytesExpectedToWrite: task.countOfBytesExpectedToReceive
-                    )
-                }
+        if let dataDelegate = task.dataCallbackDelegate,
+           let dataTask = task as? URLSessionDataTask {
+            session.delegateQueue.addOperation {
+                dataDelegate.urlSession(session, dataTask: dataTask, didReceive: data)
             }
-        default:
-            break
+        } else if let downloadDelegate = task.downloadCallbackDelegate,
+                  let downloadTask = task as? URLSessionDownloadTask {
+            let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
+            _ = fileHandle.seekToEndOfFile()
+            fileHandle.write(data)
+            task.countOfBytesReceived  += Int64(data.count)
+            session.delegateQueue.addOperation {
+                downloadDelegate.urlSession(
+                    session,
+                    downloadTask: downloadTask,
+                    didWriteData: Int64(data.count),
+                    totalBytesWritten: task.countOfBytesReceived,
+                    totalBytesExpectedToWrite: task.countOfBytesExpectedToReceive
+                )
+            }
         }
     }
 
@@ -165,10 +158,7 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         guard let task = self.task, let session = task.session as? URLSession else {
             return
         }
-        switch session.behaviour(for: task) {
-        case .taskDelegate(let delegate),
-             .dataCompletionHandlerWithTaskDelegate(_, let delegate),
-             .downloadCompletionHandlerWithTaskDelegate(_, let delegate):
+        if let delegate = task.callbackDelegate {
             task.countOfBytesSent += count
             session.delegateQueue.addOperation {
                 delegate.urlSession(
@@ -179,8 +169,6 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
                     totalBytesExpectedToSend: task.countOfBytesExpectedToSend
                 )
             }
-        default:
-            break
         }
     }
 
@@ -304,7 +292,7 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         // TODO: InputStream is not Sendable, but it seems safe here because of the wait on the dispatch group. It would be nice to prove this to the compiler.
         nonisolated(unsafe) var currentInputStream: InputStream?
         
-        if let delegate = task?.delegate {
+        if let delegate = task?.effectiveDelegate {
             let dispatchGroup = DispatchGroup()
             dispatchGroup.enter()
             
@@ -350,21 +338,16 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         guard let task = task else {
             fatalError()
         }
-        let s = task.session as! URLSession
-        switch s.behaviour(for: task) {
-        case .noDelegate:
-            return .ignore
-        case .taskDelegate:
+        switch task.completion {
+        case nil:
             // Data will be forwarded to the delegate as we receive it, we don't
             // need to do anything about it.
             return .ignore
-        case .dataCompletionHandler,
-             .dataCompletionHandlerWithTaskDelegate:
+        case .data:
             // Data needs to be concatenated in-memory such that we can pass it
             // to the completion handler upon completion.
             return .inMemory(nil)
-        case .downloadCompletionHandler,
-             .downloadCompletionHandlerWithTaskDelegate:
+        case .download:
             // Data needs to be written to a file (i.e. a download task).
             let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
             return .toFile(self.tempFileURL, fileHandle)
@@ -411,8 +394,8 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
 
     func resume() {
         if case .initial = self.internalState {
-            guard let r = task?.originalRequest else {
-                fatalError("Task has no original request.")
+            guard let r = task?.currentRequest else {
+                fatalError("Task has no current request.")
             }
             
             // Check if the cached response is good to use:

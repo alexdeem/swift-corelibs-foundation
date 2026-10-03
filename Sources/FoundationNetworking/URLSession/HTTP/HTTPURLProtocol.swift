@@ -358,37 +358,9 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         // HTTP Options:
         easyHandle.set(followLocation: false)
 
-        // The httpAdditionalHeaders from session configuration has to be added to the request.
-        // The request.allHTTPHeaders can override the httpAdditionalHeaders elements. Add the
-        // httpAdditionalHeaders from session configuration first and then append/update the
-        // request.allHTTPHeaders so that request.allHTTPHeaders can override httpAdditionalHeaders.
-
         let httpSession = self.task?.session as! URLSession
-        var httpHeaders: [AnyHashable : Any]?
-
-        if let hh = httpSession.configuration.httpAdditionalHeaders {
-            httpHeaders = hh
-        }
-
-        if let hh = request.allHTTPHeaderFields {
-            if httpHeaders == nil {
-                httpHeaders = hh
-            } else {
-                hh.forEach {
-                    // When adding a header, remove any current entry with the same header name regardless of case
-                    let newKey = $0.lowercased()
-                    for key in httpHeaders!.keys {
-                        if newKey == (key as! String).lowercased() {
-                            httpHeaders?.removeValue(forKey: key)
-                            break
-                        }
-                    }
-                    httpHeaders![$0] = $1
-                }
-            }
-        }
         let customHeaders: [String]
-        let headersForRequest = curlHeaders(for: httpHeaders)
+        let headersForRequest = curlHeaders(for: request.allHTTPHeaderFields)
         var hasStream = (request.httpBodyStream != nil)
         if case _Body.stream(_) = body {
             hasStream = true
@@ -471,7 +443,7 @@ internal class _HTTPURLProtocol: _NativeProtocol {
 
         guard let session = task?.session as? URLSession else { fatalError() }
 
-        if let delegate = task?.delegate {
+        if let delegate = task?.effectiveDelegate {
             // At this point we need to change the internal state to note
             // that we're waiting for the delegate to call the completion
             // handler. Then we'll call the delegate callback
@@ -518,13 +490,7 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         guard let _ = task as? URLSessionDataTask else { return }
         guard case .transferInProgress(let ts) = self.internalState else { fatalError("Transfer not in progress.") }
         guard let response = ts.response as? HTTPURLResponse else { fatalError("Header complete, but not URL response.") }
-        guard let session = task?.session as? URLSession else { fatalError() }
-        switch session.behaviour(for: self.task!) {
-        case .noDelegate:
-            break
-        case .taskDelegate,
-             .dataCompletionHandlerWithTaskDelegate,
-             .downloadCompletionHandlerWithTaskDelegate:
+        if self.task!.callbackDelegate != nil {
             //TODO: There's a problem with libcurl / with how we're using it.
             // We're currently unable to pause the transfer / the easy handle:
             // https://curl.haxx.se/mail/lib-2016-03/0222.html
@@ -537,10 +503,6 @@ internal class _HTTPURLProtocol: _NativeProtocol {
             default:
                 self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             }
-        case .dataCompletionHandler:
-            break
-        case .downloadCompletionHandler:
-            break
         }
     }
 
@@ -622,10 +584,10 @@ internal class _HTTPURLProtocol: _NativeProtocol {
     /// expects.
     ///
     /// - SeeAlso: https://curl.haxx.se/libcurl/c/CURLOPT_HTTPHEADER.html
-    func curlHeaders(for httpHeaders: [AnyHashable : Any]?) -> [String] {
+    func curlHeaders(for httpHeaders: [String : String]?) -> [String] {
         var result: [String] = []
         var names = Set<String>()
-	if let hh = httpHeaders as? [String : String] {
+	if let hh = httpHeaders {
             hh.forEach {
                 let name = $0.0.lowercased()
                 guard !names.contains(name) else { return }
@@ -708,10 +670,12 @@ extension _HTTPURLProtocol {
         // If the request is `nil`, we're supposed to treat the current response
         // as the final response, i.e. not do any redirection.
         // Otherwise, we'll start a new transfer with the passed in request.
-        if let r = request {
+        if let request {
+            let session = task?.session as! URLSession
+            let configuredRequest = session._configuration.configure(request: request)
             lastRedirectBody = nil
             task?.knownBody = URLSessionTask._Body.none
-            startNewTransfer(with: r)
+            startNewTransfer(with: configuredRequest)
         } else {
             // If the redirect is not followed, return the redirect itself as the response
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
