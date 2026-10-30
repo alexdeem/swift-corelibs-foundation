@@ -91,7 +91,7 @@ internal class _DataURLProtocol: URLProtocol {
             urlClient.urlProtocolDidFinishLoading(self)
         } else {
             let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorBadURL)
-            if let task = self.task, let session = task.actualSession, let delegate = task.delegate {
+            if let task = self.task, let session = task.actualSession, let delegate = task.effectiveDelegate {
                 delegate.urlSession(session, task: task, didCompleteWithError: error)
             }
         }
