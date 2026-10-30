@@ -24,14 +24,117 @@ internal class _HTTPURLProtocol: _NativeProtocol {
     // and the 3xx response is returned to the client and the data is sent via the delegate notify
     // mechanism. `lastRedirectBody` holds the body of the redirect currently being processed.
     var lastRedirectBody: Data? = nil
-    private var redirectCount = 0
-
     public required init(task: URLSessionTask, cachedResponse: CachedURLResponse?, client: URLProtocolClient?) {
         super.init(task: task, cachedResponse: cachedResponse, client: client)
     }
 
     public required init(request: URLRequest, cachedResponse: CachedURLResponse?, client: URLProtocolClient?) {
         super.init(request: request, cachedResponse: cachedResponse, client: client)
+    }
+
+    private var previousFailureCount = 0
+    private var lastCredential: (protectionSpace: URLProtectionSpace, credential: URLCredential)?
+    private var pendingChallenge: URLAuthenticationChallenge?
+
+    override func completeTask() {
+        guard case .transferCompleted(let response, _) = internalState else {
+            fatalError("Trying to complete an unfinished HTTP transfer.")
+        }
+        task?.response = response
+        // Authentication decisions may outlive the transfer's timeout.
+        easyHandle.timeoutTimer = nil
+        guard let response = response as? HTTPURLResponse, response.statusCode == 401,
+              let protectionSpace = URLProtectionSpace.create(with: response),
+              let task, let session = task.session as? URLSession else {
+            finishAuthentication()
+            return
+        }
+
+        // Serialize challenge creation and sender replies on the task's work queue.
+        nonisolated(unsafe) let owner = self
+        @Sendable func propose(_ credential: URLCredential?) {
+            task.workQueue.async {
+                guard task.state != .canceling && task.state != .completed else { return }
+                let proposed = owner.lastCredential?.credential == credential ? nil : credential
+                let challenge = URLAuthenticationChallenge(
+                    protectionSpace: protectionSpace, proposedCredential: proposed,
+                    previousFailureCount: owner.previousFailureCount, failureResponse: response,
+                    error: nil, sender: _HTTPAuthenticationChallengeSender(owner))
+                owner.previousFailureCount += 1
+                owner.pendingChallenge = challenge
+                owner.client?.urlProtocol(owner, didReceive: challenge)
+            }
+        }
+
+        if let storage = session.configuration.urlCredentialStorage {
+            storage.getCredentials(for: protectionSpace, task: task) { credentials in
+                if let credentials, let key = credentials.keys.sorted().first {
+                    propose(credentials[key])
+                } else {
+                    storage.getDefaultCredential(for: protectionSpace, task: task, completionHandler: propose)
+                }
+            }
+        } else {
+            propose(nil)
+        }
+    }
+
+    private func finishAuthentication() {
+        if let task, let session = task.session as? URLSession, let lastCredential {
+            session.configuration.urlCredentialStorage?.set(
+                lastCredential.credential, for: lastCredential.protectionSpace, task: task)
+        }
+        super.completeTask()
+    }
+
+    fileprivate func answer(_ challenge: URLAuthenticationChallenge,
+                            disposition: URLSession.AuthChallengeDisposition, credential: URLCredential?) {
+        guard let task, task.state != .canceling && task.state != .completed,
+              pendingChallenge === challenge else { return }
+        pendingChallenge = nil
+        switch disposition {
+        case .useCredential:
+            guard let credential else {
+                finishAuthentication()
+                return
+            }
+            retry(with: credential, for: challenge.protectionSpace)
+        case .performDefaultHandling:
+            if let proposed = challenge.proposedCredential, proposed != lastCredential?.credential {
+                retry(with: proposed, for: challenge.protectionSpace)
+            } else {
+                finishAuthentication()
+            }
+        case .rejectProtectionSpace, .cancelAuthenticationChallenge:
+            // Only a single protection space per HTTP request is supported.
+            task.cancel()
+        }
+    }
+
+    private func retry(with credential: URLCredential, for protectionSpace: URLProtectionSpace) {
+        guard let task, var request = task.currentRequest else { fatalError("Missing HTTP request") }
+        switch protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodHTTPBasic:
+            let userPassword = "\(credential.user ?? ""):\(credential.password ?? "")"
+            let encoded = Data(userPassword.utf8).base64EncodedString()
+            request.setValue("Basic \(encoded)", forHTTPHeaderField: "Authorization")
+        case NSURLAuthenticationMethodHTTPDigest:
+            fatalError("The URLSession swift-corelibs-foundation implementation doesn't currently handle digest authentication.")
+        default:
+            fatalError("\(protectionSpace.authenticationMethod) is not supported")
+        }
+        lastCredential = (protectionSpace, credential)
+        if case .transferCompleted(_, .toFile(_, let fileHandle?)) = internalState {
+            fileHandle.truncateFile(atOffset: 0)
+            fileHandle.closeFile()
+        } else if task is URLSessionDownloadTask {
+            // Delegate-based downloads write directly to this file rather than
+            // using a transfer body drain.
+            let fileHandle = try! FileHandle(forWritingTo: tempFileURL)
+            fileHandle.truncateFile(atOffset: 0)
+            fileHandle.closeFile()
+        }
+        startNewTransfer(with: request)
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -358,37 +461,9 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         // HTTP Options:
         easyHandle.set(followLocation: false)
 
-        // The httpAdditionalHeaders from session configuration has to be added to the request.
-        // The request.allHTTPHeaders can override the httpAdditionalHeaders elements. Add the
-        // httpAdditionalHeaders from session configuration first and then append/update the
-        // request.allHTTPHeaders so that request.allHTTPHeaders can override httpAdditionalHeaders.
-
         let httpSession = self.task?.session as! URLSession
-        var httpHeaders: [AnyHashable : Any]?
-
-        if let hh = httpSession.configuration.httpAdditionalHeaders {
-            httpHeaders = hh
-        }
-
-        if let hh = request.allHTTPHeaderFields {
-            if httpHeaders == nil {
-                httpHeaders = hh
-            } else {
-                hh.forEach {
-                    // When adding a header, remove any current entry with the same header name regardless of case
-                    let newKey = $0.lowercased()
-                    for key in httpHeaders!.keys {
-                        if newKey == (key as! String).lowercased() {
-                            httpHeaders?.removeValue(forKey: key)
-                            break
-                        }
-                    }
-                    httpHeaders![$0] = $1
-                }
-            }
-        }
         let customHeaders: [String]
-        let headersForRequest = curlHeaders(for: httpHeaders)
+        let headersForRequest = curlHeaders(for: request.allHTTPHeaderFields)
         var hasStream = (request.httpBodyStream != nil)
         if case _Body.stream(_) = body {
             hasStream = true
@@ -455,49 +530,20 @@ internal class _HTTPURLProtocol: _NativeProtocol {
             fatalError("Trying to redirect, but the transfer is not complete.")
         }
 
-        // Avoid a never ending redirect chain by having a hard limit on the number of redirects.
-        // This value mirrors Darwin.
-        redirectCount += 1
-        if redirectCount > 20 {
-            self.internalState = .transferFailed
-            let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorHTTPTooManyRedirects,
-                                userInfo: [NSLocalizedDescriptionKey: "too many HTTP redirects"])
-            guard let request = task?.currentRequest else {
-                fatalError("In a redirect chain but no current task/request")
+        guard let task else { return }
+        internalState = .waitingForRedirectCompletionHandler(response: response, bodyDataDrain: bodyDataDrain)
+        // The coordinator invokes completion on task.workQueue, which protects this protocol's state.
+        nonisolated(unsafe) let protocolInstance = self
+        task._decideRedirect(from: self, request: request, response: response) { result in
+            // A timeout may have completed the transfer while the delegate was deciding.
+            guard case .waitingForRedirectCompletionHandler = protocolInstance.internalState else { return }
+            switch result {
+            case .success(let request):
+                protocolInstance.didCompleteRedirectCallback(request)
+            case .failure(let error):
+                protocolInstance.internalState = .transferFailed
+                protocolInstance.failWith(error: error as NSError, request: task.currentRequest ?? request)
             }
-            failWith(error: error, request: request)
-            return
-        }
-
-        guard let session = task?.session as? URLSession else { fatalError() }
-
-        if let delegate = task?.delegate {
-            // At this point we need to change the internal state to note
-            // that we're waiting for the delegate to call the completion
-            // handler. Then we'll call the delegate callback
-            // (willPerformHTTPRedirection). The task will then switch out of
-            // its internal state once the delegate calls the completion
-            // handler.
-
-            //TODO: Should the `public response: URLResponse` property be updated
-            // before we call delegate API
-            self.internalState = .waitingForRedirectCompletionHandler(response: response, bodyDataDrain: bodyDataDrain)
-            // We need this ugly cast in order to be able to support `URLSessionTask.init()`
-            let task = self.task!
-            // Self state is protected by the dispatch queue
-            nonisolated(unsafe) let nonisolatedSelf = self
-            session.delegateQueue.addOperation {
-                delegate.urlSession(session, task: task, willPerformHTTPRedirection: response as! HTTPURLResponse, newRequest: request) { (request: URLRequest?) in
-                    task.workQueue.async {
-                        nonisolatedSelf.didCompleteRedirectCallback(request)
-                    }
-                }
-            }
-        } else {
-            // Follow the redirect. Need to configure new request with cookies, etc.
-            let configuredRequest = session._configuration.configure(request: request)
-            task?.knownBody = URLSessionTask._Body.none
-            startNewTransfer(with: configuredRequest)
         }
     }
 
@@ -518,13 +564,7 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         guard let _ = task as? URLSessionDataTask else { return }
         guard case .transferInProgress(let ts) = self.internalState else { fatalError("Transfer not in progress.") }
         guard let response = ts.response as? HTTPURLResponse else { fatalError("Header complete, but not URL response.") }
-        guard let session = task?.session as? URLSession else { fatalError() }
-        switch session.behaviour(for: self.task!) {
-        case .noDelegate:
-            break
-        case .taskDelegate,
-             .dataCompletionHandlerWithTaskDelegate,
-             .downloadCompletionHandlerWithTaskDelegate:
+        if self.task!.callbackDelegate != nil {
             //TODO: There's a problem with libcurl / with how we're using it.
             // We're currently unable to pause the transfer / the easy handle:
             // https://curl.haxx.se/mail/lib-2016-03/0222.html
@@ -537,10 +577,6 @@ internal class _HTTPURLProtocol: _NativeProtocol {
             default:
                 self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             }
-        case .dataCompletionHandler:
-            break
-        case .downloadCompletionHandler:
-            break
         }
     }
 
@@ -579,9 +615,28 @@ internal class _HTTPURLProtocol: _NativeProtocol {
 
         // If targetURL has only relative path of url, create a new valid url with relative path
         // Otherwise, return request with targetURL ie.url from location field
-        guard targetURL.scheme == nil || targetURL.host == nil else {
-            request.url = targetURL
+        func redirectedRequest(to url: URL) -> URLRequest {
+            func effectivePort(_ url: URL) -> Int? {
+                if let port = url.port { return port }
+                switch url.scheme?.lowercased() {
+                case "http": return 80
+                case "https": return 443
+                default: return nil
+                }
+            }
+            // Preserve credentials within an origin, including redirects that
+            // add or omit its default port. Do not forward them to another origin.
+            if let source = request.url,
+               source.scheme?.lowercased() != url.scheme?.lowercased()
+                || source.host?.lowercased() != url.host?.lowercased()
+                || effectivePort(source) != effectivePort(url) {
+                request.setValue(nil, forHTTPHeaderField: "Authorization")
+            }
+            request.url = url
             return request
+        }
+        guard targetURL.scheme == nil || targetURL.host == nil else {
+            return redirectedRequest(to: targetURL)
         }
 
         guard
@@ -609,9 +664,7 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         components.percentEncodedFragment = targetURL.fragment
 
         guard let url = components.url else { fatalError("Invalid URL") }
-        request.url = url
-
-        return request
+        return redirectedRequest(to: url)
     }
 
     /// These are a list of headers that should be passed to libcurl.
@@ -622,10 +675,10 @@ internal class _HTTPURLProtocol: _NativeProtocol {
     /// expects.
     ///
     /// - SeeAlso: https://curl.haxx.se/libcurl/c/CURLOPT_HTTPHEADER.html
-    func curlHeaders(for httpHeaders: [AnyHashable : Any]?) -> [String] {
+    func curlHeaders(for httpHeaders: [String : String]?) -> [String] {
         var result: [String] = []
         var names = Set<String>()
-	if let hh = httpHeaders as? [String : String] {
+	if let hh = httpHeaders {
             hh.forEach {
                 let name = $0.0.lowercased()
                 guard !names.contains(name) else { return }
@@ -680,6 +733,40 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         }
         
         return ["Expect"]
+    }
+}
+
+// A sender can be called from any delegate queue. Its weak reference avoids a
+// cycle through the protocol's pending challenge; HTTP state is accessed only
+// after dispatching back to the task's work queue.
+private final class _HTTPAuthenticationChallengeSender: NSObject, URLAuthenticationChallengeSender, @unchecked Sendable {
+    private weak var owner: _HTTPURLProtocol?
+
+    init(_ owner: _HTTPURLProtocol) { self.owner = owner }
+
+    private func answer(_ challenge: URLAuthenticationChallenge,
+                        _ disposition: URLSession.AuthChallengeDisposition, _ credential: URLCredential? = nil) {
+        guard let owner, let task = owner.task else { return }
+        nonisolated(unsafe) let protocolOwner = owner
+        task.workQueue.async {
+            protocolOwner.answer(challenge, disposition: disposition, credential: credential)
+        }
+    }
+
+    func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) {
+        answer(challenge, .useCredential, credential)
+    }
+    func continueWithoutCredential(for challenge: URLAuthenticationChallenge) {
+        answer(challenge, .useCredential)
+    }
+    func performDefaultHandling(for challenge: URLAuthenticationChallenge) {
+        answer(challenge, .performDefaultHandling)
+    }
+    func rejectProtectionSpaceAndContinue(with challenge: URLAuthenticationChallenge) {
+        answer(challenge, .rejectProtectionSpace)
+    }
+    func cancel(_ challenge: URLAuthenticationChallenge) {
+        answer(challenge, .cancelAuthenticationChallenge)
     }
 }
 

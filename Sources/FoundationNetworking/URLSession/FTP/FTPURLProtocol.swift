@@ -113,16 +113,8 @@ internal extension _FTPURLProtocol {
         guard let _ = task as? URLSessionDataTask else { return }
         guard case .transferInProgress(let ts) = self.internalState else { fatalError("Transfer not in progress.") }
         guard let response = ts.response else { fatalError("Header complete, but not URL response.") }
-        guard let session = task?.session as? URLSession else { fatalError() }
-        switch session.behaviour(for: self.task!) {
-        case .noDelegate:
-            break
-        case .taskDelegate, .dataCompletionHandlerWithTaskDelegate, .downloadCompletionHandlerWithTaskDelegate:
+        if self.task!.callbackDelegate != nil {
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        case .dataCompletionHandler:
-            break
-        case .downloadCompletionHandler:
-            break
         }
     }
 }
