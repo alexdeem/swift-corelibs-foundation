@@ -125,60 +125,6 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     fileprivate let _protocolLock = NSLock() // protects:
     fileprivate var _protocolStorage: ProtocolState = .toBeCreated
     internal    var _lastCredentialUsedFromStorageDuringAuthentication: (protectionSpace: URLProtectionSpace, credential: URLCredential)?
-
-    // Redirect state is confined to workQueue, including delegate decisions.
-    private var pendingRedirectProtocol: URLProtocol?
-    private var redirectCount = 0
-
-    // Deliver the decision on workQueue; each protocol continues its own load.
-    func _decideRedirect(from urlProtocol: URLProtocol, request: URLRequest, response redirectResponse: URLResponse,
-                         completion: @escaping @Sendable (Result<URLRequest?, URLError>) -> Void) {
-        guard let session = actualSession else { return }
-        // Carry the non-Sendable reference onto workQueue; compare protocol storage under _protocolLock.
-        nonisolated(unsafe) let redirectingProtocol = urlProtocol
-        self.workQueue.async {
-            guard self.state != .canceling && self.state != .completed else { return }
-            let isCurrent = self._protocolLock.performLocked { () -> Bool in
-                guard case .existing(let current) = self._protocolStorage else { return false }
-                return current === redirectingProtocol
-            }
-            guard isCurrent, self.pendingRedirectProtocol == nil else { return }
-
-            self.redirectCount += 1
-            if self.redirectCount > 20 {
-                let error = URLError(.httpTooManyRedirects)
-                self.error = error
-                completion(.failure(error))
-                return
-            }
-
-            let redirectID = self.redirectCount
-            self.pendingRedirectProtocol = redirectingProtocol
-            @Sendable func decide(_ chosenRequest: URLRequest?) {
-                self.workQueue.async {
-                    guard self.pendingRedirectProtocol === redirectingProtocol, self.redirectCount == redirectID else { return }
-                    self.pendingRedirectProtocol = nil
-                    guard self.state != .canceling && self.state != .completed else { return }
-                    let isCurrent = self._protocolLock.performLocked { () -> Bool in
-                        guard case .existing(let current) = self._protocolStorage else { return false }
-                        return current === redirectingProtocol
-                    }
-                    guard isCurrent else { return }
-                    completion(.success(chosenRequest))
-                }
-            }
-
-            if let delegate = self.delegate, let response = redirectResponse as? HTTPURLResponse {
-                session.delegateQueue.addOperation {
-                    delegate.urlSession(session, task: self, willPerformHTTPRedirection: response, newRequest: request,
-                                        completionHandler: decide)
-                }
-            } else {
-                decide(request)
-            }
-        }
-    }
-
     
     private var _protocolClass: URLProtocol.Type? {
         guard let request = currentRequest else { fatalError("A protocol class was requested, but we do not have a current request") }
@@ -270,6 +216,99 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     }
     
     
+    // Redirect state is confined to workQueue, including delegate decisions.
+    private var pendingRedirectProtocol: URLProtocol?
+    private var redirectCount = 0
+
+    // Deliver the decision on workQueue; each protocol continues its own load.
+    func _decideRedirect(from urlProtocol: URLProtocol, request: URLRequest, response redirectResponse: URLResponse,
+                         completion: @escaping @Sendable (Result<URLRequest?, URLError>) -> Void) {
+        guard let session = actualSession else { return }
+        // Carry the non-Sendable reference onto workQueue; compare protocol storage under _protocolLock.
+        nonisolated(unsafe) let redirectingProtocol = urlProtocol
+        self.workQueue.async {
+            guard self.state != .canceling && self.state != .completed else { return }
+            let isCurrent = self._protocolLock.performLocked { () -> Bool in
+                guard case .existing(let current) = self._protocolStorage else { return false }
+                return current === redirectingProtocol
+            }
+            guard isCurrent, self.pendingRedirectProtocol == nil else { return }
+
+            self.redirectCount += 1
+            if self.redirectCount > 20 {
+                let error = URLError(.httpTooManyRedirects)
+                self.error = error
+                completion(.failure(error))
+                return
+            }
+
+            let redirectID = self.redirectCount
+            self.pendingRedirectProtocol = redirectingProtocol
+            @Sendable func decide(_ chosenRequest: URLRequest?) {
+                self.workQueue.async {
+                    guard self.pendingRedirectProtocol === redirectingProtocol, self.redirectCount == redirectID else { return }
+                    self.pendingRedirectProtocol = nil
+                    guard self.state != .canceling && self.state != .completed else { return }
+                    let isCurrent = self._protocolLock.performLocked { () -> Bool in
+                        guard case .existing(let current) = self._protocolStorage else { return false }
+                        return current === redirectingProtocol
+                    }
+                    guard isCurrent else { return }
+                    completion(.success(chosenRequest))
+                }
+            }
+
+            if let delegate = self.delegate, let response = redirectResponse as? HTTPURLResponse {
+                session.delegateQueue.addOperation {
+                    delegate.urlSession(session, task: self, willPerformHTTPRedirection: response, newRequest: request,
+                                        completionHandler: decide)
+                }
+            } else {
+                decide(request)
+            }
+        }
+    }
+
+    // Called on workQueue after the redirect delegate has chosen a request.
+    fileprivate func _followRedirect(to request: URLRequest, from oldProtocol: URLProtocol, client: _ProtocolClient) {
+        guard let session = actualSession else { return }
+        let configuredRequest = session._configuration.configure(request: request)
+
+        // Stop the old hop before making the next one visible. Its client must
+        // not deliver a late response or completion into the same task.
+        oldProtocol.client = nil
+        oldProtocol.stopLoading()
+        currentRequest = configuredRequest
+        response = nil
+        client.bodyChunks = []
+        client.cacheableResponse = nil
+
+        if let data = configuredRequest.httpBody {
+            knownBody = .data(createDispatchData(data))
+        } else if let stream = configuredRequest.httpBodyStream {
+            knownBody = .stream(stream)
+        } else {
+            knownBody = URLSessionTask._Body.none
+        }
+
+        _protocolLock.performLocked { _protocolStorage = .toBeCreated }
+        _getProtocol { nextProtocol in
+            // _getProtocol protects protocol storage with its lock; start the returned protocol on workQueue.
+            nonisolated(unsafe) let nextProtocol = nextProtocol
+            self.workQueue.async {
+                guard self.state != .canceling && self.state != .completed else { return }
+                if let nextProtocol {
+                    nextProtocol.startLoading()
+                } else {
+                    let error = URLError(.unsupportedURL)
+                    self.error = error
+                    client.urlProtocol(task: self, didFailWithError: error)
+                }
+            }
+        }
+    }
+
+
     internal var knownBody: _Body?
     func getBody(completion: @escaping (_Body) -> Void) {
         if let body = knownBody {
@@ -1461,7 +1500,22 @@ extension _ProtocolClient : URLProtocolClient {
     func urlProtocol(_ protocol: URLProtocol, cachedResponseIsValid cachedResponse: CachedURLResponse) {}
 
     func urlProtocol(_ protocol: URLProtocol, wasRedirectedTo request: URLRequest, redirectResponse: URLResponse) {
-        fatalError("The URLSession swift-corelibs-foundation implementation doesn't currently handle redirects directly.")
+        guard let task = `protocol`.task else { return }
+        // The coordinator invokes completion on task.workQueue before we access this non-Sendable protocol.
+        nonisolated(unsafe) let redirectingProtocol = `protocol`
+        task._decideRedirect(from: `protocol`, request: request, response: redirectResponse) { result in
+            switch result {
+            case .success(let request?):
+                task._followRedirect(to: request, from: redirectingProtocol, client: self)
+            case .success(nil):
+                // The protocol remains responsible for delivering the declined response.
+                break
+            case .failure(let error):
+                redirectingProtocol.client = nil
+                redirectingProtocol.stopLoading()
+                self.urlProtocol(task: task, didFailWithError: error)
+            }
+        }
     }
 }
 extension URLSessionTask {
