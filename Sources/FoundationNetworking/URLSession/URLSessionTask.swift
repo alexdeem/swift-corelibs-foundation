@@ -125,6 +125,60 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
     fileprivate let _protocolLock = NSLock() // protects:
     fileprivate var _protocolStorage: ProtocolState = .toBeCreated
     internal    var _lastCredentialUsedFromStorageDuringAuthentication: (protectionSpace: URLProtectionSpace, credential: URLCredential)?
+
+    // Redirect state is confined to workQueue, including delegate decisions.
+    private var pendingRedirectProtocol: URLProtocol?
+    private var redirectCount = 0
+
+    // Deliver the decision on workQueue; each protocol continues its own load.
+    func _decideRedirect(from urlProtocol: URLProtocol, request: URLRequest, response redirectResponse: URLResponse,
+                         completion: @escaping @Sendable (Result<URLRequest?, URLError>) -> Void) {
+        guard let session = actualSession else { return }
+        // Carry the non-Sendable reference onto workQueue; compare protocol storage under _protocolLock.
+        nonisolated(unsafe) let redirectingProtocol = urlProtocol
+        self.workQueue.async {
+            guard self.state != .canceling && self.state != .completed else { return }
+            let isCurrent = self._protocolLock.performLocked { () -> Bool in
+                guard case .existing(let current) = self._protocolStorage else { return false }
+                return current === redirectingProtocol
+            }
+            guard isCurrent, self.pendingRedirectProtocol == nil else { return }
+
+            self.redirectCount += 1
+            if self.redirectCount > 20 {
+                let error = URLError(.httpTooManyRedirects)
+                self.error = error
+                completion(.failure(error))
+                return
+            }
+
+            let redirectID = self.redirectCount
+            self.pendingRedirectProtocol = redirectingProtocol
+            @Sendable func decide(_ chosenRequest: URLRequest?) {
+                self.workQueue.async {
+                    guard self.pendingRedirectProtocol === redirectingProtocol, self.redirectCount == redirectID else { return }
+                    self.pendingRedirectProtocol = nil
+                    guard self.state != .canceling && self.state != .completed else { return }
+                    let isCurrent = self._protocolLock.performLocked { () -> Bool in
+                        guard case .existing(let current) = self._protocolStorage else { return false }
+                        return current === redirectingProtocol
+                    }
+                    guard isCurrent else { return }
+                    completion(.success(chosenRequest))
+                }
+            }
+
+            if let delegate = self.delegate, let response = redirectResponse as? HTTPURLResponse {
+                session.delegateQueue.addOperation {
+                    delegate.urlSession(session, task: self, willPerformHTTPRedirection: response, newRequest: request,
+                                        completionHandler: decide)
+                }
+            } else {
+                decide(request)
+            }
+        }
+    }
+
     
     private var _protocolClass: URLProtocol.Type? {
         guard let request = currentRequest else { fatalError("A protocol class was requested, but we do not have a current request") }
@@ -212,6 +266,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
         _protocolLock.performLocked {
             _protocolStorage = .invalidated
         }
+        workQueue.async { self.pendingRedirectProtocol = nil }
     }
     
     
@@ -389,6 +444,7 @@ open class URLSessionTask : NSObject, NSCopying, @unchecked Sendable {
                 return false
             }
             guard !canceled else { return }
+            self.pendingRedirectProtocol = nil
             self._getProtocol { (urlProtocol) in
                 // The combination of locking in getProtocol and dispatching to the work queue let us use the normally non-Sendable URLProtocol
                 nonisolated(unsafe) let urlProtocol = urlProtocol
