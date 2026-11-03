@@ -34,11 +34,9 @@ internal let enableDebugOutput: Bool = {
 
 internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
     internal var easyHandle: _EasyHandle!
-    internal lazy var tempFileURL: URL = {
-        let fileName = NSTemporaryDirectory() + NSUUID().uuidString + ".tmp"
-        _ = FileManager.default.createFile(atPath: fileName, contents: nil)
-        return URL(fileURLWithPath: fileName)
-    }()
+    internal lazy var downloadFile = _DownloadFile(url: FileManager.default.temporaryDirectory
+        .appendingPathComponent(NSUUID().uuidString + ".tmp"))
+    private var downloadFileError: URLError?
 
     public required init(task: URLSessionTask, cachedResponse: CachedURLResponse?, client: URLProtocolClient?) {
         self.internalState = .initial
@@ -115,7 +113,15 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
             return .proceed
         }
 
-        internalState = .transferInProgress(ts.byAppending(bodyData: data))
+        do {
+            internalState = .transferInProgress(try ts.byAppending(bodyData: data))
+        } catch {
+            // Do not remove the easy handle while inside a libcurl callback.
+            // Returning abort completes the transfer, where we report this error
+            // instead of libcurl's generic write failure.
+            downloadFileError = error
+            return .abort
+        }
         notifyDelegate(aboutReceivedData: data)
         return .proceed
     }
@@ -216,6 +222,8 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         // If everything went well, we will simply forward the resulting data
         // to the delegate. But in case of redirects etc. we might send another
         // request.
+        let error = (downloadFileError as NSError?) ?? error
+        downloadFileError = nil
         guard error == nil else {
             internalState = .transferFailed
             failWith(error: error!, request: request)
@@ -278,9 +286,14 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
             }
             self.client?.urlProtocol(self, didLoad: data)
             self.internalState = .taskCompleted
-        } else if case .toFile(let url, let fileHandle?) = bodyDataDrain {
-            self.properties[.temporaryFileURL] = url
-            fileHandle.closeFile()
+        } else if case .toFile(let file) = bodyDataDrain {
+            do {
+                self.properties[.temporaryFileURL] = try file.finish()
+            } catch {
+                internalState = .transferFailed
+                failWith(error: error as NSError, request: request)
+                return
+            }
         }
         self.client?.urlProtocolDidFinishLoading(self)
         self.internalState = .taskCompleted
@@ -315,7 +328,7 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
                 switch currentTransferState.requestBodySource {
                 case is _BodyStreamSource:
                     try _InputStreamSPIForFoundationNetworkingUseOnly(inputStream).seek(to: position)
-                    let drain = self.createTransferBodyDataDrain()
+                    let drain = try self.createTransferBodyDataDrain()
                     let source = _BodyStreamSource(inputStream: inputStream)
                     let transferState = _TransferState(url: url, bodyDataDrain: drain, bodySource: source)
                     self.internalState = .transferInProgress(transferState)
@@ -339,7 +352,7 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
     /// The data drain.
     ///
     /// This depends on what the delegate / completion handler need.
-    fileprivate func createTransferBodyDataDrain() -> _DataDrain {
+    fileprivate func createTransferBodyDataDrain() throws(URLError) -> _DataDrain {
         guard let task = task else {
             fatalError()
         }
@@ -347,8 +360,8 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         // a completion handler and a delegate. Delegate callbacks only report
         // progress; they must not write the same bytes a second time.
         if task is URLSessionDownloadTask {
-            let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
-            return .toFile(self.tempFileURL, fileHandle)
+            try downloadFile.open()
+            return .toFile(downloadFile)
         }
         let s = task.session as! URLSession
         switch s.behaviour(for: task) {
@@ -366,13 +379,13 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         case .downloadCompletionHandler,
              .downloadCompletionHandlerWithTaskDelegate:
             // Data needs to be written to a file (i.e. a download task).
-            let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
-            return .toFile(self.tempFileURL, fileHandle)
+            try downloadFile.open()
+            return .toFile(downloadFile)
         }
     }
 
-    func createTransferState(url: URL, body: _Body, workQueue: DispatchQueue) -> _TransferState {
-        let drain = createTransferBodyDataDrain()
+    func createTransferState(url: URL, body: _Body, workQueue: DispatchQueue) throws(URLError) -> _TransferState {
+        let drain = try createTransferBodyDataDrain()
         switch body {
         case .none:
             return _TransferState(url: url, bodyDataDrain: drain)
@@ -400,7 +413,13 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         }
 
         task.getBody { (body) in
-            self.internalState = .transferReady(self.createTransferState(url: url, body: body, workQueue: task.workQueue))
+            do {
+                self.internalState = .transferReady(try self.createTransferState(url: url, body: body, workQueue: task.workQueue))
+            } catch {
+                self.internalState = .transferFailed
+                self.failWith(error: error as NSError, request: request)
+                return
+            }
             self.configureEasyHandle(for: request, body: body)
             if (task.suspendCount) < 1 {
                 self.resume()
@@ -479,6 +498,7 @@ extension _NativeProtocol {
         }
         //We don't want a timeout to be triggered after this. The timeout timer needs to be cancelled.
         easyHandle.timeoutTimer = nil
+        downloadFile.discard()
         self.internalState = .taskCompleted
     }
 
