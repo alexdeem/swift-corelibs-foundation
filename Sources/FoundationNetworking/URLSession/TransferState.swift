@@ -201,3 +201,86 @@ extension _NativeProtocol._TransferState {
                                               parsedResponseHeader: parsedResponseHeader, response: response, requestBodySource: newSource, bodyDataDrain: bodyDataDrain)
     }
 }
+
+/// Owns a download's temporary file until it is handed to the client.
+internal final class _DownloadFile {
+    let url: URL
+    private(set) var fileHandle: FileHandle?
+    private var ownsFile = false
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    deinit {
+        discard()
+    }
+
+    @discardableResult
+    func open() throws(URLError) -> FileHandle {
+        if let fileHandle { return fileHandle }
+        if !ownsFile {
+            do {
+                // Unlike createFile, this reports the underlying creation error.
+                try Data().write(to: url, options: .withoutOverwriting)
+                ownsFile = true
+            } catch {
+                throw fileError(.cannotCreateFile, underlying: error)
+            }
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            fileHandle = handle
+            return handle
+        } catch {
+            throw fileError(.cannotOpenFile, underlying: error)
+        }
+    }
+
+    func append(_ data: Data) throws(URLError) {
+        let handle = try open()
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            throw fileError(.cannotWriteToFile, underlying: error)
+        }
+    }
+
+    func reset() throws(URLError) {
+        let handle = try open()
+        do {
+            try handle.truncate(atOffset: 0)
+            try handle.seek(toOffset: 0)
+        } catch {
+            throw fileError(.cannotWriteToFile, underlying: error)
+        }
+    }
+
+    func finish() throws(URLError) -> URL {
+        let handle = try open()
+        do {
+            try handle.close()
+        } catch {
+            throw fileError(.cannotCloseFile, underlying: error)
+        }
+        fileHandle = nil
+        ownsFile = false
+        return url
+    }
+
+    func discard() {
+        // Cleanup must not replace the error that caused the download to fail.
+        try? fileHandle?.close()
+        fileHandle = nil
+        if ownsFile {
+            try? FileManager.default.removeItem(at: url)
+            ownsFile = false
+        }
+    }
+
+    private func fileError(_ code: URLError.Code, underlying error: Error) -> URLError {
+        return URLError(code, userInfo: [NSUnderlyingErrorKey: error,
+                                       NSURLErrorFailingURLErrorKey: url])
+    }
+}
