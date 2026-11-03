@@ -415,6 +415,11 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
         XCTAssertEqual(200, httpResponse.statusCode, "HTTP response code is not 200")
         XCTAssertNotNil(location, "Download location was nil")
         XCTAssertTrue(delegate.totalBytesWritten > 0)
+        defer { try? FileManager.default.removeItem(at: location) }
+        let data = try Data(contentsOf: location)
+        XCTAssertEqual(Int64(data.count), delegate.totalBytesWritten)
+        XCTAssertEqual(String(data: data, encoding: .utf8),
+                       "A country is a region that is identified as a distinct national entity in political geography")
     }
 
     func test_gzippedDownloadTask() async {

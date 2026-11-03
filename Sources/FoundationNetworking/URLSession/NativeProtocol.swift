@@ -115,8 +115,8 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
             return .proceed
         }
 
-        notifyDelegate(aboutReceivedData: data)
         internalState = .transferInProgress(ts.byAppending(bodyData: data))
+        notifyDelegate(aboutReceivedData: data)
         return .proceed
     }
 
@@ -142,9 +142,6 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
                 }
             } else if let downloadDelegate = delegate as? URLSessionDownloadDelegate,
                       let downloadTask = task as? URLSessionDownloadTask {
-                let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
-                _ = fileHandle.seekToEndOfFile()
-                fileHandle.write(data)
                 task.countOfBytesReceived  += Int64(data.count)
                 session.delegateQueue.addOperation {
                     downloadDelegate.urlSession(
@@ -284,10 +281,6 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
         } else if case .toFile(let url, let fileHandle?) = bodyDataDrain {
             self.properties[.temporaryFileURL] = url
             fileHandle.closeFile()
-        } else if task is URLSessionDownloadTask {
-            let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
-            fileHandle.closeFile()
-            self.properties[.temporaryFileURL] = self.tempFileURL
         }
         self.client?.urlProtocolDidFinishLoading(self)
         self.internalState = .taskCompleted
@@ -349,6 +342,13 @@ internal class _NativeProtocol: URLProtocol, _EasyHandleDelegate {
     fileprivate func createTransferBodyDataDrain() -> _DataDrain {
         guard let task = task else {
             fatalError()
+        }
+        // All download tasks share one file drain, including tasks with both
+        // a completion handler and a delegate. Delegate callbacks only report
+        // progress; they must not write the same bytes a second time.
+        if task is URLSessionDownloadTask {
+            let fileHandle = try! FileHandle(forWritingTo: self.tempFileURL)
+            return .toFile(self.tempFileURL, fileHandle)
         }
         let s = task.session as! URLSession
         switch s.behaviour(for: task) {

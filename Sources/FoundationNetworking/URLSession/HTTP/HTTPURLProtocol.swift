@@ -129,12 +129,6 @@ internal class _HTTPURLProtocol: _NativeProtocol {
         if case .transferCompleted(_, .toFile(_, let fileHandle?)) = internalState {
             fileHandle.truncateFile(atOffset: 0)
             fileHandle.closeFile()
-        } else if task is URLSessionDownloadTask {
-            // Delegate-based downloads write directly to this file rather than
-            // using a transfer body drain.
-            let fileHandle = try! FileHandle(forWritingTo: tempFileURL)
-            fileHandle.truncateFile(atOffset: 0)
-            fileHandle.closeFile()
         }
         startNewTransfer(with: request)
     }
