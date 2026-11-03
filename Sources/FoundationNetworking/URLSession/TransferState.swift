@@ -55,7 +55,7 @@ extension _NativeProtocol {
         /// Concatenate in-memory
         case inMemory(NSMutableData?)
         /// Write to file
-        case toFile(URL, FileHandle?)
+        case toFile(_DownloadFile)
         /// Do nothing. Might be forwarded to delegate
         case ignore
     }
@@ -175,19 +175,16 @@ extension _NativeProtocol._TransferState {
     /// - Important: This will mutate the existing `NSMutableData` that the
     ///     struct may already have in place -- copying the data is too
     ///     expensive. This behaviour
-    func byAppending(bodyData buffer: Data) -> _NativeProtocol._TransferState {
+    func byAppending(bodyData buffer: Data) throws(URLError) -> _NativeProtocol._TransferState {
         switch bodyDataDrain {
         case .inMemory(let bodyData):
             let data: NSMutableData = bodyData ?? NSMutableData()
             data.append(buffer)
             let drain = _NativeProtocol._DataDrain.inMemory(data)
             return _NativeProtocol._TransferState(url: url, parsedResponseHeader: parsedResponseHeader, response: response, requestBodySource: requestBodySource, bodyDataDrain: drain)
-        case .toFile(_, let fileHandle):
-             //TODO: Create / open the file for writing
-             // Append to the file
-             _ = fileHandle!.seekToEndOfFile()
-             fileHandle!.write(buffer)
-             return self
+        case .toFile(let file):
+            try file.append(buffer)
+            return self
         case .ignore:
             return self
         }

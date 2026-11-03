@@ -422,6 +422,60 @@ final class TestURLSession: LoopbackServerTest, @unchecked Sendable {
                        "A country is a region that is identified as a distinct national entity in political geography")
     }
 
+    func test_downloadAuthenticationRetryReplacesResponseBody() async throws {
+        class Delegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+            let completed: XCTestExpectation
+            let usesCompletionHandler: Bool
+
+            init(completed: XCTestExpectation, usesCompletionHandler: Bool) {
+                self.completed = completed
+                self.usesCompletionHandler = usesCompletionHandler
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                            completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+                completionHandler(.useCredential, URLCredential(user: "user", password: "passwd", persistence: .none))
+            }
+
+            func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+                XCTAssertFalse(usesCompletionHandler)
+                defer { try? FileManager.default.removeItem(at: location) }
+                XCTAssertEqual(try String(contentsOf: location, encoding: .utf8), "{\"authenticated\":true,\"user\":\"user\"}\n")
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                XCTAssertNil(error)
+                completed.fulfill()
+            }
+        }
+
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(TestURLSession.serverPort)/auth/basic/body"))
+        for usesCompletionHandler in [false, true] {
+            let completed = expectation(description: "Authenticated download: completion handler = \(usesCompletionHandler)")
+            let delegate = Delegate(completed: completed, usesCompletionHandler: usesCompletionHandler)
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.urlCredentialStorage = nil
+            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+            defer { session.invalidateAndCancel() }
+            let task: URLSessionDownloadTask
+            if usesCompletionHandler {
+                task = session.downloadTask(with: url) { location, response, error in
+                    defer { completed.fulfill() }
+                    XCTAssertNil(error)
+                    XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+                    guard let location else { return XCTFail("Missing download file") }
+                    defer { try? FileManager.default.removeItem(at: location) }
+                    XCTAssertEqual(try String(contentsOf: location, encoding: .utf8), "{\"authenticated\":true,\"user\":\"user\"}\n")
+                }
+                task.delegate = delegate
+            } else {
+                task = session.downloadTask(with: url)
+            }
+            task.resume()
+            await fulfillment(of: [completed], timeout: 12)
+        }
+    }
+
     func test_gzippedDownloadTask() async {
         let urlString = "http://127.0.0.1:\(TestURLSession.serverPort)/gzipped-response"
         let url = URL(string: urlString)!

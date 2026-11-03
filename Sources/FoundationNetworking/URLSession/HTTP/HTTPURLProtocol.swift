@@ -126,9 +126,14 @@ internal class _HTTPURLProtocol: _NativeProtocol {
             fatalError("\(protectionSpace.authenticationMethod) is not supported")
         }
         lastCredential = (protectionSpace, credential)
-        if case .transferCompleted(_, .toFile(_, let fileHandle?)) = internalState {
-            fileHandle.truncateFile(atOffset: 0)
-            fileHandle.closeFile()
+        if case .transferCompleted(_, .toFile(let file)) = internalState {
+            do {
+                try file.reset()
+            } catch {
+                internalState = .transferFailed
+                failWith(error: error as NSError, request: request)
+                return
+            }
         }
         startNewTransfer(with: request)
     }
